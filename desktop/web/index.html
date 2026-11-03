@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#4f46e5">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="DropLink">
+<meta name="format-detection" content="telephone=no">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/api/icon?size=192&v=2">
+<link rel="icon" type="image/png" href="/api/icon?size=64&v=2">
+<link rel="shortcut icon" type="image/png" href="/api/icon?size=64&v=2">
+<link rel="stylesheet" href="/static/styles.css?v=11">
+<title>DropLink 互传</title>
+</head>
+<body>
+
+<div class="app">
+  <!-- 侧栏 / 底部导航 -->
+  <nav class="nav">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <img src="/api/icon?size=64" alt="DropLink" width="64" height="64">
+      </div>
+      <div class="brand-text"><b>DropLink</b><span>局域网互传</span></div>
+    </div>
+    <div class="nav-items">
+      <button class="nav-item is-active" data-view="browse">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+        <span>浏览</span>
+      </button>
+      <button class="nav-item" data-view="send">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"/><path d="m6 11 6-6 6 6"/></svg>
+        <span>传文件</span>
+      </button>
+      <button class="nav-item" data-view="clip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="4" width="10" height="17" rx="2"/><path d="M9 4.5A1.5 1.5 0 0 1 10.5 3h3A1.5 1.5 0 0 1 15 4.5"/><path d="M10 10h4M10 14h4"/></svg>
+        <span>剪贴板</span>
+      </button>
+      <button class="nav-item" data-view="about">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><circle cx="12" cy="8" r=".6" fill="currentColor" stroke="none"/></svg>
+        <span>我的</span>
+      </button>
+    </div>
+    <div class="nav-foot" id="navFoot"></div>
+  </nav>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="peer">
+        <span class="dot" id="netDot"></span>
+        <div class="peer-text">
+          <div class="peer-name" id="deviceName">正在连接…</div>
+          <div class="peer-sub" id="deviceSub">局域网直连 · 不消耗流量</div>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button class="icon-btn" data-act="theme" id="themeBtn" title="切换主题">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M18.4 5.6 17 7M7 17l-1.4 1.4"/></svg>
+        </button>
+        <button class="icon-btn" data-act="refresh" title="刷新">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg>
+        </button>
+        <button class="icon-btn" data-act="goAbout" title="连接信息">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.6"/><rect x="14" y="3" width="7" height="7" rx="1.6"/><rect x="3" y="14" width="7" height="7" rx="1.6"/><path d="M14 14h3v3h-3zM20 14v7h-7"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="views">
+      <!-- ============ 浏览 ============ -->
+      <section class="view is-active" id="view-browse">
+        <div class="inline-tip"><b>怎么用：</b>点文件夹进入、点文件预览；长按或点「选择」可多选，再打包下载。手机传来的文件在<b>「DropLink 接收」</b>文件夹。<b>连不上？</b>看右上角状态，或到「我的」→「检测连接问题」。</div>
+
+        <div class="crumbs" id="crumbs"></div>
+
+        <div class="roots" id="roots"></div>
+
+        <div class="toolbar">
+          <div class="toolbar-title" id="listTitle">文件</div>
+          <div class="toolbar-actions">
+            <button class="chip" data-act="toggleSelect" id="selBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 12 5 5L20 6"/></svg>
+              <span>选择</span>
+            </button>
+            <button class="chip" data-act="toggleMode" id="modeBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><rect x="4" y="4" width="7" height="7" rx="1.4"/><rect x="13" y="4" width="7" height="7" rx="1.4"/><rect x="4" y="13" width="7" height="7" rx="1.4"/><rect x="13" y="13" width="7" height="7" rx="1.4"/></svg>
+              <span>网格</span>
+            </button>
+            <button class="chip" data-act="search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+              <span>搜索</span>
+            </button>
+          </div>
+        </div>
+
+        <div id="fileList" class="filelist"></div>
+        <div id="emptyState" class="empty hidden"></div>
+        <div id="listFoot" class="list-foot"></div>
+      </section>
+
+      <!-- ============ 传文件 ============ -->
+      <section class="view" id="view-send">
+        <div class="hero">
+          <h1>把文件丢过来</h1>
+          <p>手机 ↔ 电脑，同一个 Wi-Fi 内直连传输，不经过互联网。</p>
+        </div>
+        <div class="inline-tip"><b>怎么用：</b>把文件拖到下面，或点「选择文件」上传到电脑；手机端在「传文件」页也能传。<b>传不动？</b>确认手机已配对（右上角状态），或「我的」→「检测连接问题」。</div>
+
+        <!-- 传输中心 · 实时可视化 -->
+        <div class="viz-card" id="vizCard">
+          <div class="viz-head">
+            <div class="viz-title"><span class="live-dot"></span>传输中心</div>
+            <div class="viz-state" id="vizState">待机中</div>
+          </div>
+
+          <div class="viz-stage" id="vizStage">
+            <canvas id="vizCanvas"></canvas>
+            <div class="viz-node node-phone">
+              <div class="node-ring"></div>
+              <div class="node-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="7" y="2.5" width="10" height="19" rx="2.6"/><path d="M10.8 18.6h2.4"/>
+                </svg>
+              </div>
+              <span>手机</span>
+            </div>
+            <div class="viz-node node-pc">
+              <div class="node-ring"></div>
+              <div class="node-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M2 20h20"/>
+                </svg>
+              </div>
+              <span>电脑</span>
+            </div>
+            <div class="viz-burst" id="vizBurst">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m4 12.5 5 5L20 6.5"/></svg>
+            </div>
+          </div>
+
+          <div class="viz-foot">
+            <div class="viz-speed">
+              <b id="vizSpeed">0.0</b><span>MB/s</span>
+            </div>
+            <div class="viz-meta">
+              <div><b id="vizCount">0</b><span>个文件</span></div>
+              <div><b id="vizBytes">0 B</b><span>本次传输</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="section" id="liveSection" hidden>
+          <div class="section-head">
+            <h2>正在发送</h2>
+            <span class="muted" style="font-size:12px">其他设备正在从本机下载</span>
+          </div>
+          <div id="liveBox" class="queue"></div>
+        </div>
+
+        <!-- 电脑端：发送文件到手机 -->
+        <div class="card" id="sendPanel" hidden>
+          <h3>发送文件到手机</h3>
+          <p class="muted" style="font-size:12.5px;margin:0 0 12px">选择电脑上的文件，推送到已连接的手机。</p>
+          <div class="send-files" id="sendFileList"></div>
+          <button class="btn btn-primary" data-act="pickSendFiles">选择文件</button>
+
+          <h3 style="margin-top:18px">发送到哪些设备</h3>
+          <div class="send-devices" id="sendDevices">
+            <label class="dev-item"><input type="checkbox" id="sendAll" checked><span>全部设备</span></label>
+            <div id="sendDeviceList"></div>
+          </div>
+          <p class="muted" id="sendDeviceHint" style="font-size:12px;margin:8px 0 0">正在读取已连接设备…</p>
+
+          <button class="btn btn-primary btn-block" data-act="doSend" id="doSendBtn" style="margin-top:14px">发送</button>
+        </div>
+
+        <div class="dropzone" id="dropzone">
+          <div class="dz-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+          </div>
+          <div class="dz-text"><b>选择文件上传到电脑</b><span id="dzHint">也可以把文件拖到这里</span></div>
+          <div class="dz-actions">
+            <button class="btn btn-primary" data-act="pickFiles">选择文件</button>
+            <button class="btn" data-act="pickPhotos">照片/视频</button>
+          </div>
+          <div class="dz-extra">
+            <button class="link-btn" data-act="pickCamera">拍照</button>
+            <span class="sep">·</span>
+            <button class="link-btn" data-act="pickFolder">整个文件夹</button>
+          </div>
+        </div>
+
+        <div class="section" id="queueSection" hidden>
+          <div class="section-head">
+            <h2>本次传输</h2>
+            <button class="link-btn" data-act="clearQueue">清空</button>
+          </div>
+          <div id="queue" class="queue"></div>
+        </div>
+
+        <div class="section">
+          <div class="section-head">
+            <h2>最近传输</h2>
+            <button class="link-btn" data-act="loadTransfers">刷新</button>
+          </div>
+          <div id="transfers" class="transfers"><div class="skeleton-row"></div><div class="skeleton-row"></div></div>
+        </div>
+
+        <div class="tip-card">
+          <b>省流量小贴士</b>
+          <p>只要手机和电脑连在同一个路由器的 Wi-Fi，或电脑开启「移动热点」让手机连上，传输就只走局域网，不消耗手机移动数据，也不需要互联网。</p>
+        </div>
+      </section>
+
+      <!-- ============ 剪贴板 ============ -->
+      <section class="view" id="view-clip">
+        <div class="hero">
+          <h1>剪贴板</h1>
+          <p>复制一段文字、一个链接，在另一台设备上直接粘贴。</p>
+        </div>
+        <div class="inline-tip"><b>怎么用：</b>在任一端发文字/链接，另一端会自动收到。<b>没同步？</b>确认两端都已配对、且连同一个 Wi-Fi。</div>
+        <div class="clip-box">
+          <textarea id="clipInput" rows="4" placeholder="粘贴或输入要共享的文字…" maxlength="20000"></textarea>
+          <div class="clip-actions">
+            <span class="muted" id="clipCount">0 字</span>
+            <button class="btn btn-primary" data-act="clipSend">发到另一端</button>
+          </div>
+        </div>
+        <div class="section">
+          <div class="section-head"><h2>最近内容</h2></div>
+          <div id="clipList" class="clip-list"></div>
+        </div>
+      </section>
+
+      <!-- ============ 我的 ============ -->
+      <section class="view" id="view-about">
+        <div class="hero">
+          <h1>连接信息</h1>
+          <p>手机与电脑在同一网络内即可互传，全程不经过服务器。</p>
+        </div>
+        <div class="inline-tip"><b>怎么用：</b>这里看二维码、地址和配对码；电脑有多个网卡时可在「切换网络」里选对手机连的那个。<b>连不上？</b>点「检测连接问题」一步步排查。</div>
+        <div id="aboutBody"></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- 底部选择操作条 -->
+<div class="selbar" id="selbar" hidden>
+  <div class="selbar-info"><b id="selCount">0</b> 项已选</div>
+  <div class="selbar-actions">
+    <button class="btn btn-sm" data-act="selDownload">下载</button>
+    <button class="btn btn-sm" data-act="selZip">打包</button>
+    <button class="btn btn-sm btn-danger" data-act="selDelete">删除</button>
+    <button class="btn btn-sm btn-plain" data-act="selCancel">取消</button>
+  </div>
+</div>
+
+<!-- 登录 -->
+<div class="login" id="login" hidden>
+  <div class="login-card">
+    <div class="login-logo">
+      <img src="/api/icon?size=96" alt="DropLink" width="96" height="96">
+    </div>
+    <h1>连接到电脑</h1>
+    <p class="muted">输入电脑屏幕上显示的 6 位配对码</p>
+    <input id="pinInput" class="pin-input" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="one-time-code" placeholder="······">
+    <div class="login-error" id="loginError"></div>
+    <button class="btn btn-primary btn-block" data-act="login">连接</button>
+    <p class="login-foot">电脑上运行「启动.bat」后，窗口里会显示配对码。<br>仅同一局域网内可用，不消耗流量。</p>
+  </div>
+</div>
+
+<!-- 通用弹层 -->
+<div class="sheet" id="sheet" hidden>
+  <div class="sheet-card" id="sheetCard"></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<!-- 首次使用引导 -->
+<div class="guide" id="guide" hidden>
+  <div class="guide-mask" data-act="guideSkip"></div>
+  <div class="guide-card">
+    <button class="guide-close icon-btn" data-act="guideSkip" title="跳过">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"/></svg>
+    </button>
+    <div class="guide-slides">
+      <div class="guide-slide is-on" data-gstep="0">
+        <div class="guide-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="8.5" height="12" rx="2"/><path d="M6.5 16.5h.01"/><rect x="13" y="3.5" width="8.5" height="17" rx="2"/><path d="M17 18.5h.01"/><path d="M11 12h2M9.5 12h0"/></svg>
+        </div>
+        <h2>手机和电脑，直接传文件</h2>
+        <p>同一个 Wi-Fi 内直连，<b>不经过互联网、不上传云端、不消耗手机流量</b>，速度比网盘快得多。</p>
+      </div>
+      <div class="guide-slide" data-gstep="1">
+        <div class="guide-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8.5a14 14 0 0 1 19 0"/><path d="M5.5 12a9.5 9.5 0 0 1 13 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/></svg>
+        </div>
+        <h2>先把手机连上来</h2>
+        <p>让手机连上和电脑<b>同一个 Wi-Fi</b>，扫「我的」页里的二维码；或让手机浏览器打开那个地址，输入 <b>6 位配对码</b>。</p>
+      </div>
+      <div class="guide-slide" data-gstep="2">
+        <div class="guide-ico">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="m7.5 9.5 4.5 4.5 4.5-4.5"/><path d="M4 17v1.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V17"/></svg>
+        </div>
+        <h2>两边怎么互传</h2>
+        <p>手机：在「浏览」里看、下载电脑文件，「传文件」上传照片和视频。电脑：把文件拖进来，或点文件「分享」让手机扫码下载。文字、链接走「剪贴板」。</p>
+      </div>
+    </div>
+    <div class="guide-dots" id="guideDots"><i class="is-on"></i><i></i><i></i></div>
+    <div class="guide-actions">
+      <button class="btn btn-plain" data-act="guideSkip">跳过</button>
+      <button class="btn btn-primary" data-act="guideNext">下一步</button>
+    </div>
+  </div>
+</div>
+
+
+<input type="file" id="fileInput" multiple hidden>
+<input type="file" id="sendFileInput" multiple hidden>
+<input type="file" id="photoInput" accept="image/*,video/*" multiple hidden>
+<input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
+<input type="file" id="folderInput" webkitdirectory directory multiple hidden>
+
+<script src="/static/app.js?v=11"></script>
+</body>
+</html>
