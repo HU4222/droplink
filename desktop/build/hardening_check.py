@@ -24,7 +24,7 @@ for a in sys.argv[1:]:
 
 PIN = os.environ.get("DROPLINK_PIN", "12345678")
 TOKEN = os.environ.get("DROPLINK_LOCAL_TOKEN", "testtoken123")
-RECV = os.environ.get("DROPLINK_RECV") or os.path.join(os.path.expanduser("~"), "Desktop", "DropLink 接收")
+RECV = os.environ.get("DROPLINK_RECV", os.path.join(os.path.expanduser("~"), "Desktop", "DropLink-Received"))
 PASS, FAIL = [], []
 
 

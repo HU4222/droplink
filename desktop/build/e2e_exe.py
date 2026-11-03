@@ -12,7 +12,7 @@ import http.cookiejar
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8848
 BASE = f"http://127.0.0.1:{PORT}"
-RECV = os.environ.get("DROPLINK_RECV") or os.path.join(os.path.expanduser("~"), "Desktop", "DropLink 接收")
+RECV = os.environ.get("DROPLINK_RECV", os.path.join(os.path.expanduser("~"), "Desktop", "DropLink-Received"))
 PASS, FAIL = [], []
 
 

@@ -39,7 +39,7 @@ class TransferService : Service() {
                 bytes, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
             )
         }
-        server = HttpServer(this, PORT, { storageRoot() }, localToken).apply { start() }
+        server = HttpServer(this, PORT, { storageRoot() }, { recvRoot() }, localToken).apply { start() }
         running = true
     }
 
@@ -51,6 +51,15 @@ class TransferService : Service() {
         val granted = Build.VERSION.SDK_INT < 30 || Environment.isExternalStorageManager()
         return if (granted) Environment.getExternalStorageDirectory()
         else getExternalFilesDir(null) ?: filesDir
+    }
+
+    /** 接收目录固定为 Download/DropLink，避免文件散落在存储根（BUG-08）。 */
+    private fun recvRoot(): File {
+        val dir = File(Environment.getExternalStorageDirectory(), "Download/DropLink")
+        if (dir.exists() || dir.mkdirs()) return dir
+        val fallback = File(getExternalFilesDir(null) ?: filesDir, "DropLink")
+        fallback.mkdirs()
+        return fallback
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY

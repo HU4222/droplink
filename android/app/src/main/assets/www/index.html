@@ -13,7 +13,7 @@
 <link rel="apple-touch-icon" href="/api/icon?size=192&v=2">
 <link rel="icon" type="image/png" href="/api/icon?size=64&v=2">
 <link rel="shortcut icon" type="image/png" href="/api/icon?size=64&v=2">
-<link rel="stylesheet" href="/static/styles.css?v=11">
+<link rel="stylesheet" href="/static/styles.css?v=13">
 <title>DropLink 互传</title>
 </head>
 <body>
@@ -227,7 +227,7 @@
           <textarea id="clipInput" rows="4" placeholder="粘贴或输入要共享的文字…" maxlength="20000"></textarea>
           <div class="clip-actions">
             <span class="muted" id="clipCount">0 字</span>
-            <button class="btn btn-primary" data-act="clipSend">发到另一端</button>
+            <button class="btn btn-primary" data-act="clipSend" disabled>发到另一端</button>
           </div>
         </div>
         <div class="section">
@@ -327,6 +327,6 @@
 <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
 <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
 
-<script src="/static/app.js?v=11"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "DropLink 互传"
 APP_SHORT = "DropLink"
-VERSION = "1.1.2"
+VERSION = "1.3.0"
 
 # 个人使用模式（默认）：恢复安全加固前的宽松行为——
 # 本机请求免配对、可浏览任意目录、6 位配对码、上传不写 MOTW。
@@ -373,24 +373,34 @@ def unique_path(folder: str, name: str) -> str:
     return cand
 
 
-def reserve_path(folder: str, name: str):
-    """原子占位：并发上传同名文件时不会互相覆盖（修复 X-04）。
+def claim_path(tmp_path: str, folder: str, name: str) -> str:
+    """把写好的临时文件原子地落到一个不冲突的最终文件名（并发上传不会互相覆盖）。
 
-    先用 O_CREAT|O_EXCL 抢到一个空文件，再把 .part 内容 os.replace 过去。
+    旧做法是先建一个 0 字节占位文件再替换：占位期间别人能在目录里看到一个空文件，
+    上传中断时这个空文件还会残留一会儿。改成「先写隐藏临时文件，最后 rename 抢名字」，
+    Windows 上 os.rename 在目标已存在时会抛 FileExistsError，抢占依然互斥，
+    而且整个过程比原来少一次删除。
     """
     base, ext = os.path.splitext(name)
     for i in range(10000):
         cand = os.path.join(folder, name if i == 0 else f"{base} ({i}){ext}")
+        if os.path.exists(cand):
+            continue
         try:
-            fd = os.open(cand, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+            os.rename(tmp_path, cand)
+            return cand
         except FileExistsError:
             continue
         except OSError:
-            break
-        os.close(fd)
-        return cand
+            # 目标不存在但 rename 仍失败（跨卷、被占用等）：最后试一次替换
+            if os.path.exists(cand):
+                continue
+            try:
+                os.replace(tmp_path, cand)
+                return cand
+            except OSError:
+                break
     raise RuntimeError("无法分配文件名")
-
 
 def inside(path: str, parent: str) -> bool:
     """用 realpath 比较：junction / 符号链接解析到外面时判定为「不在里面」。"""
@@ -785,8 +795,19 @@ class State:
         return item
 
     def add_transfer(self, **kw):
-        item = {"id": secrets.token_hex(6), "ts": time.time(), **kw}
+        """记一条传输。2 秒内同方向、同文件、同大小的重复请求视为同一次（修复 BUG-09）。
+
+        WebView / 浏览器经常先发一次探测请求再发正式请求，导致「一次下载两条记录」。
+        """
+        now = time.time()
         with self.lock:
+            for it in self.transfers[:5]:
+                if (it.get("name") == kw.get("name")
+                        and it.get("size") == kw.get("size")
+                        and it.get("direction") == kw.get("direction")
+                        and now - it.get("ts", 0) < 2):
+                    return it
+            item = {"id": secrets.token_hex(6), "ts": now, **kw}
             self.transfers.insert(0, item)
             del self.transfers[100:]
         return item
@@ -1492,6 +1513,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "roots": quick_roots(), "recv_dir": STATE.recv_dir})
         if path == "/api/download":
             return self.api_download(q)
+        if path == "/api/zip":
+            return self.api_zip_get(q)
         if path == "/api/thumb":
             return self.api_thumb(q)
         if path == "/api/preview":
@@ -1752,7 +1775,7 @@ class Handler(BaseHTTPRequestHandler):
             return None
         if not os.path.isfile(p):
             return self._fail(404, "文件不存在")
-        if q.get("log") == "1":
+        if q.get("log") == "1" and self.command != "HEAD":
             try:
                 STATE.add_transfer(direction="down", name=os.path.basename(p),
                                    size=os.path.getsize(p), peer=self.client_address[0])
@@ -1851,7 +1874,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._fail(400, "请求格式错误", close=True)
         text = str(data.get("text") or "").strip()
-        if not text:
+        # 只有分隔线（—— / ----）也视为空内容（BUG-05）
+        if not text or re.fullmatch(r"[—\-–_\s]+", text):
             return self._fail(400, "内容为空")
         src = str(data.get("from") or "手机")[:20]
         item = STATE.add_clip(text, src)
@@ -1979,7 +2003,21 @@ class Handler(BaseHTTPRequestHandler):
             data = self._json_body()
         except Exception:
             return self._fail(400, "请求格式错误", close=True)
-        raw = [str(p) for p in (data.get("paths") or []) if p]
+        return self._zip_paths(data.get("paths") or [])
+
+    def api_zip_get(self, q):
+        """GET 版本：安卓 WebView 无法用 fetch 接住 blob 下载，只能走导航交给 DownloadListener。"""
+        raw = q.get("paths") or "[]"
+        try:
+            paths = json.loads(raw)
+        except Exception:
+            paths = [raw]
+        if not isinstance(paths, list):
+            paths = [paths]
+        return self._zip_paths(paths)
+
+    def _zip_paths(self, raw_paths):
+        raw = [str(p) for p in raw_paths if p]
         paths = []
         for p in raw:
             try:
@@ -2346,11 +2384,6 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self._fail(507, "磁盘剩余空间不足")
 
-        try:
-            target = reserve_path(dest_dir, name)   # 原子占位，防并发覆盖（X-04）
-        except RuntimeError:
-            self.close_connection = True
-            return self._fail(500, "无法分配文件名")
         tmp_path = os.path.join(dest_dir, f".dl_{secrets.token_hex(4)}.part")
         started = time.time()
         written = 0
@@ -2367,31 +2400,34 @@ class Handler(BaseHTTPRequestHandler):
                 f.flush()
                 os.fsync(f.fileno())
         except Exception:  # noqa: BLE001
-            for p in (tmp_path, target):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             self.close_connection = True
             return self._fail(500, "写入文件失败")
 
         if written != length:
-            for p in (tmp_path, target):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             self.close_connection = True
             return self._fail(400, f"文件不完整（{written}/{length}）")
 
         try:
-            os.replace(tmp_path, target)
+            target = claim_path(tmp_path, dest_dir, name)   # 原子抢名，防并发覆盖（X-04）
+        except RuntimeError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return self._fail(500, "无法分配文件名")
         except OSError:
-            for p in (tmp_path, target):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             return self._fail(500, "保存文件失败")
 
         risky = mark_risky_file(target)
@@ -2538,6 +2574,24 @@ def start_server(port: int = 8848, pin: str = "", recv: str = "",
             print(f"[清理] 推送暂存移除 {n} 个文件，释放 {freed / 1048576:.1f} MB")
     except Exception:
         pass
+
+    # 清掉上次中断留下的临时文件（超过 24 小时的 .dl_*.part），避免长期占空间
+    def _sweep_parts():
+        try:
+            deadline = time.time() - 86400
+            for dirpath, _dirs, files in os.walk(STATE.recv_dir):
+                for fn in files:
+                    if fn.startswith(".dl_") and fn.endswith(".part"):
+                        fp = os.path.join(dirpath, fn)
+                        try:
+                            if os.path.getmtime(fp) < deadline:
+                                os.unlink(fp)
+                        except OSError:
+                            pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_sweep_parts, daemon=True).start()
 
     httpd = None
     for offset in range(0, 20):

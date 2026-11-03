@@ -4,8 +4,7 @@ import hashlib
 import os
 import time
 
-TARGET = os.environ.get("DROPLINK_TARGET") or os.path.join(
-    os.path.expanduser("~"), "Desktop", "10GB-测速文件.bin")
+TARGET = os.environ.get("DROPLINK_BIGFILE", os.path.join(os.path.expanduser("~"), "Desktop", "10GB-speedtest.bin"))
 SIZE = 10 * (1 << 30)          # 10 GiB = 10,737,418,240 B
 BLOCK = 8 << 20                # 8 MiB
 

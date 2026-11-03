@@ -1,35 +1,29 @@
-# Python
+# Build artifacts
+*.pyc
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
-# 运行时产物
-desktop/config.json
-desktop/.port
-desktop/*.log
-desktop/.cache/
-desktop/vendor/
-desktop/build/_stage/
-desktop/*.exe
-desktop/*.obj
-desktop/*.res
-
-# 安卓构建产物与密钥
-android/.gradle/
-android/build/
-android/app/build/
-android/local.properties
-android/*.keystore
-android/gradle-8.7/
-android/app/release/
+*.exe
+*.obj
 *.apk
 *.aab
+*.log
 
-# 生成的启动图标（跑 tools/gen_launcher_icons.py 重新生成）
-android/app/src/main/res/mipmap-*/ic_launcher.png
+# Local configuration / secrets
+*.keystore
+*.jks
+local.properties
+config.json
+.port
 
-# 系统
+# Dependencies and caches
+node_modules/
+.gradle/
+.cache/
+vendor/
+_stage/
+
+# IDE
+.idea/
+*.iml
+.vscode/
 .DS_Store
 Thumbs.db

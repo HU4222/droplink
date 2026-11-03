@@ -2,13 +2,26 @@ package com.droplink.app
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.AlertDialog
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.os.StatFs
+import android.provider.DocumentsContract
+import android.widget.FrameLayout
+import android.widget.TextView
 import android.webkit.JavascriptInterface
 import android.webkit.WebSettings
 import android.webkit.WebView
@@ -25,6 +38,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.documentfile.provider.DocumentFile
 import org.json.JSONObject
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.NetworkInterface
 import java.net.URL
@@ -47,6 +61,19 @@ class MainActivity : AppCompatActivity() {
 
     // 下载保存目录（SAF）与待下载任务
     private var saveDirUri: Uri? = null
+    private val prefs by lazy { getSharedPreferences("droplink", MODE_PRIVATE) }
+    @Volatile private var downloadCancelled = false
+    @Volatile private var downloading = false
+    private var errorView: TextView? = null
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val loadWatchdog = Runnable { showLoadTimeout() }
+
+    /** 通知栏「取消」按钮：把当前下载标记为取消，下载线程会删掉 .part。 */
+    private val cancelReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == ACTION_CANCEL_DOWNLOAD) downloadCancelled = true
+        }
+    }
     private var pendingUrl: String? = null
     private var pendingName: String = "file"
     private var pendingMime: String = "application/octet-stream"
@@ -67,7 +94,8 @@ class MainActivity : AppCompatActivity() {
                 )
             } catch (_: Exception) {}
             saveDirUri = uri
-            doPendingDownload()
+            prefs.edit().putString("saveDir", uri.toString()).apply()
+            startDownloadFlow()
         }
     }
 
@@ -76,6 +104,9 @@ class MainActivity : AppCompatActivity() {
         const val PICK_REQUEST = 101
         const val PERMISSION_REQUEST = 102
         const val FILE_CHOOSER_REQUEST = 103
+        const val ACTION_CANCEL_DOWNLOAD = "com.droplink.app.CANCEL_DOWNLOAD"
+        const val DL_CHANNEL_ID = "droplink-download"
+        const val DL_NOTIFY_ID = 2001
 
         /** 启动占位页：纯本地渲染，避免等服务绑定时闪出「网页无法使用」。 */
         val SPLASH_HTML = """
@@ -99,12 +130,41 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        cleanStaleParts()
+        saveDirUri = prefs.getString("saveDir", null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
+        try {
+            val filter = IntentFilter(ACTION_CANCEL_DOWNLOAD)
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(cancelReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            } else {
+                registerReceiver(cancelReceiver, filter)
+            }
+        } catch (_: Exception) {}
+
         // 启动前台服务（持有内置 HTTP 服务，保活进程，避免退后台被系统杀掉）
         val svc = Intent(this, TransferService::class.java)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
 
         webView = WebView(this)
-        setContentView(webView)
+        val root = FrameLayout(this)
+        root.addView(webView, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        val ev = TextView(this).apply {
+            text = "页面加载超时\n\n点此重试"
+            gravity = android.view.Gravity.CENTER
+            setTextColor(0xFFE8EAF4.toInt())
+            textSize = 16f
+            setBackgroundColor(0xFF12141F.toInt())
+            visibility = android.view.View.GONE
+            setOnClickListener {
+                visibility = android.view.View.GONE
+                webView.loadUrl(pageUrl.ifBlank { homeUrl() })
+            }
+        }
+        errorView = ev
+        root.addView(ev, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        setContentView(root)
 
         webView.settings.apply {
             javaScriptEnabled = true
@@ -124,10 +184,20 @@ class MainActivity : AppCompatActivity() {
         webView.webViewClient = object : WebViewClient() {
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 pageUrl = url ?: ""
+                errorView?.visibility = android.view.View.GONE
+                uiHandler.removeCallbacks(loadWatchdog)
+                uiHandler.postDelayed(loadWatchdog, 12000)
+                rememberRemote(url)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 pageUrl = url ?: pageUrl
+                uiHandler.removeCallbacks(loadWatchdog)
+                errorView?.visibility = android.view.View.GONE
+                // 首页加载完成后清掉「启动占位页」的历史记录，返回键不会退到空白页（BUG-01）
+                if (url != null && url.startsWith("http://127.0.0.1:${TransferService.PORT}/")) {
+                    view?.clearHistory()
+                }
             }
 
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -162,6 +232,43 @@ class MainActivity : AppCompatActivity() {
                 return true
             }
 
+            /**
+             * 网页里的 confirm()/alert() 默认会显示「http://127.0.0.1 网页指出：」这种标题，
+             * 看起来像钓鱼提示，也把内部地址暴露给用户。改成应用内弹窗（标题固定 DropLink）。
+             */
+            override fun onJsConfirm(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: android.webkit.JsResult?
+            ): Boolean {
+                if (message == null || result == null) return false
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("DropLink")
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .setPositiveButton("确定") { _, _ -> result.confirm() }
+                    .setNegativeButton("取消") { _, _ -> result.cancel() }
+                    .show()
+                return true
+            }
+
+            override fun onJsAlert(
+                view: WebView?,
+                url: String?,
+                message: String?,
+                result: android.webkit.JsResult?
+            ): Boolean {
+                if (message == null || result == null) return false
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("DropLink")
+                    .setMessage(message)
+                    .setCancelable(false)
+                    .setPositiveButton("知道了") { _, _ -> result.confirm() }
+                    .show()
+                return true
+            }
+
             override fun onShowFileChooser(
                 view: WebView?,
                 callback: ValueCallback<Array<Uri>>?,
@@ -182,6 +289,9 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        // 仅调试包开放 WebView 调试端口，用来跑真机自动化；release 包不开放
+        if (BuildConfig.DEBUG) WebView.setWebContentsDebuggingEnabled(true)
+
         webView.addJavascriptInterface(Bridge(), "androidBridge")
 
         // 拦截下载：让用户指定保存目录，完成后提示实际路径
@@ -189,8 +299,7 @@ class MainActivity : AppCompatActivity() {
             pendingUrl = url
             pendingMime = mimeType ?: "application/octet-stream"
             pendingName = parseName(contentDisposition, url)
-            if (saveDirUri != null) doPendingDownload()
-            else pickDirLauncher.launch(null)
+            if (saveDirUri != null) startDownloadFlow() else pickDirLauncher.launch(null)
         }
 
         // 先显示启动占位页：服务还没绑定端口时直接 loadUrl 会闪一下「网页无法使用」，
@@ -212,91 +321,327 @@ class MainActivity : AppCompatActivity() {
         return "http://127.0.0.1:${TransferService.PORT}/?v=$v&k=$tok"
     }
 
+    /** 解析保存名：优先 RFC 5987 的 filename*，否则退回 filename，最后才用 URL 末段。 */
     private fun parseName(contentDisposition: String?, url: String): String {
         val cd = contentDisposition ?: ""
-        val m = Regex("filename\\*?=(?:UTF-8'')?\"?([^\";]+)\"?").find(cd)
-        if (m != null) {
-            return try { java.net.URLDecoder.decode(m.groupValues[1], "UTF-8") } catch (_: Exception) { m.groupValues[1] }
+        val star = Regex("filename\\*=UTF-8''([^;]+)", RegexOption.IGNORE_CASE).find(cd)
+        if (star != null) {
+            val raw = star.groupValues[1].trim().trim('"')
+            return try {
+                java.net.URLDecoder.decode(raw, "UTF-8")
+            } catch (_: Exception) {
+                raw
+            }
+        }
+        val plain = Regex("filename=\"?([^\";]+)\"?", RegexOption.IGNORE_CASE).find(cd)
+        if (plain != null) {
+            val raw = plain.groupValues[1].trim()
+            return try {
+                java.net.URLDecoder.decode(raw, "UTF-8")
+            } catch (_: Exception) {
+                raw
+            }
         }
         return url.substringAfterLast('/').substringBefore('?').ifBlank { "file" }
     }
 
-    private fun doPendingDownload() {
+    private fun fmtBytes(n: Long): String {
+        if (n < 0) return "未知"
+        if (n < 1024) return "$n B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var v = n.toDouble() / 1024
+        var i = 0
+        while (v >= 1024 && i < units.size - 1) {
+            v /= 1024
+            i++
+        }
+        return String.format(java.util.Locale.US, "%.1f %s", v, units[i])
+    }
+
+    private fun freeBytes(): Long = try {
+        StatFs(Environment.getExternalStorageDirectory().absolutePath).availableBytes
+    } catch (_: Exception) {
+        0L
+    }
+
+    /** 下载前先探测大小并让用户确认，避免误触直接写满存储（BUG-02）。 */
+    private fun startDownloadFlow() {
         val url = pendingUrl ?: return
-        val dirUri = saveDirUri ?: return
         val name = pendingName
         val mime = pendingMime
+        if (downloading) {
+            toastMsg("已有下载在进行，请稍候")
+            return
+        }
+        kotlin.concurrent.thread(isDaemon = true) {
+            val size = probeSize(url)
+            runOnUiThread {
+                val free = freeBytes()
+                val msg = buildString {
+                    append(name)
+                    append("\n大小：").append(if (size >= 0) fmtBytes(size) else "未知")
+                    if (free > 0) append("\n剩余空间：").append(fmtBytes(free))
+                    if (size > 0 && free in 1 until size) append("\n\n空间不足，可能写到一半失败。")
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("下载到手机")
+                    .setMessage(msg)
+                    .setPositiveButton("下载") { _, _ -> doDownload(url, name, mime) }
+                    .setNegativeButton("取消", null)
+                    .show()
+            }
+        }
+    }
+
+    /** 用 Range 探测总大小，不下载正文。 */
+    private fun probeSize(url: String): Long = try {
+        val conn = URL(url).openConnection() as HttpURLConnection
+        conn.connectTimeout = 5000
+        conn.readTimeout = 5000
+        conn.setRequestProperty("Range", "bytes=0-0")
+        CookieManager.getInstance().getCookie(url)?.let { if (it.isNotEmpty()) conn.setRequestProperty("Cookie", it) }
+        conn.connect()
+        val cr = conn.getHeaderField("Content-Range")
+        val total = cr?.substringAfterLast('/')?.trim()?.toLongOrNull()
+        val len = total ?: conn.contentLengthLong
+        conn.disconnect()
+        len
+    } catch (_: Exception) {
+        -1L
+    }
+
+    private fun doDownload(url: String, name: String, mime: String) {
+        val dirUri = saveDirUri ?: return
+        downloading = true
+        downloadCancelled = false
         pendingUrl = null
-        thread {
+        kotlin.concurrent.thread(isDaemon = true) {
+            var part: DocumentFile? = null
             try {
                 val conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 10000
-                conn.readTimeout = 30000
-                // 关键：携带 WebView 里已配对的 cookie（dlsess），
-                // 否则目标服务的鉴权会拒绝下载（返回 401，抛 FileNotFoundException 显示"下载失败"）
+                conn.connectTimeout = 15000
+                conn.readTimeout = 60000
                 try {
                     val cookie = CookieManager.getInstance().getCookie(url)
                     if (!cookie.isNullOrEmpty()) conn.setRequestProperty("Cookie", cookie)
                 } catch (_: Exception) {}
                 conn.connect()
                 val code = conn.responseCode
-                if (code != 200) {
+                if (code != 200 && code != 206) {
                     runOnUiThread { toastMsg("下载失败：服务器返回 $code") }
                     return@thread
                 }
-                val input = conn.inputStream
+                val total = conn.contentLengthLong
                 val tree = DocumentFile.fromTreeUri(this, dirUri)
-                val file = tree?.createFile(mime, name)
-                if (file == null) {
-                    runOnUiThread { toastMsg("无法在该目录创建文件") }
-                    input.close()
+                if (tree == null) {
+                    runOnUiThread { toastMsg("无法访问保存目录") }
                     return@thread
                 }
-                val os = contentResolver.openOutputStream(file.uri)
+                // 同名文件追加 (1)(2)，避免覆盖（BUG-03）
+                val finalName = uniqueName(tree, name)
+                // 先写 .part，完成后改名：中断时不会留下“看起来完整”的半截文件（BUG-02）
+                val partFile = tree.createFile("application/octet-stream", "$finalName.part")
+                if (partFile == null) {
+                    runOnUiThread { toastMsg("无法在该目录创建文件") }
+                    return@thread
+                }
+                part = partFile
+                val os = contentResolver.openOutputStream(partFile.uri)
                 if (os == null) {
                     runOnUiThread { toastMsg("无法写入文件") }
-                    input.close()
                     return@thread
                 }
-                input.copyTo(os)
+                val input = conn.inputStream
+                var done = 0L
+                var lastNotify = 0L
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    if (downloadCancelled) break
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    os.write(buf, 0, n)
+                    done += n
+                    val now = System.currentTimeMillis()
+                    if (now - lastNotify > 400) {
+                        lastNotify = now
+                        notifyProgress(name, done, total)
+                    }
+                }
+                os.flush()
                 os.close()
                 input.close()
+                conn.disconnect()
+
+                if (downloadCancelled) {
+                    partFile.delete()
+                    cancelNotification()
+                    runOnUiThread { toastMsg("已取消下载") }
+                    return@thread
+                }
+                val newUri = try {
+                    DocumentsContract.renameDocument(contentResolver, partFile.uri, finalName)
+                } catch (_: Exception) {
+                    null
+                }
+                if (newUri == null) {
+                    cancelNotification()
+                    runOnUiThread { toastMsg("下载完成，但重命名失败：${partFile.name}") }
+                    return@thread
+                }
                 val dirName = tree.name ?: "所选目录"
+                finishNotification(name, "$dirName/$name")
                 runOnUiThread {
-                    toastMsg("已保存到 $dirName/$name")
-                    showNotification("$dirName/$name", "文件已保存")
+                    toastMsg("已保存到 $dirName/$finalName")
+                    showNotification("$dirName/$finalName", "文件已保存")
                 }
             } catch (e: Exception) {
+                try {
+                    part?.delete()
+                } catch (_: Exception) {}
+                cancelNotification()
                 runOnUiThread { toastMsg("下载失败：${e.message}") }
+            } finally {
+                downloading = false
             }
         }
+    }
+
+    /** 启动时清掉超过 24 小时的 .part 残片（报告 A.2：中断后不该长期占空间）。 */
+    private fun cleanStaleParts() {
+        kotlin.concurrent.thread(isDaemon = true) {
+            try {
+                val dir = File(Environment.getExternalStorageDirectory(), "Download/DropLink")
+                if (!dir.isDirectory) return@thread
+                val deadline = System.currentTimeMillis() - 24L * 3600 * 1000
+                dir.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.endsWith(".part") && f.lastModified() < deadline) {
+                        f.delete()
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** 同名时生成 "名称 (1).扩展名"。 */
+    private fun uniqueName(tree: DocumentFile, name: String): String {
+        if (tree.findFile(name) == null) return name
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        var i = 1
+        while (i < 1000) {
+            val candidate = "$base ($i)$ext"
+            if (tree.findFile(candidate) == null) return candidate
+            i++
+        }
+        return "$base-${System.currentTimeMillis()}$ext"
+    }
+
+    private fun ensureDownloadChannel() {
+        if (Build.VERSION.SDK_INT < 26) return
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (nm.getNotificationChannel(DL_CHANNEL_ID) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(DL_CHANNEL_ID, "文件下载", NotificationManager.IMPORTANCE_LOW))
+        }
+    }
+
+    private fun notifyProgress(name: String, done: Long, total: Long) {
+        try {
+            ensureDownloadChannel()
+            val pct = if (total > 0) ((done * 100) / total).toInt() else 0
+            val cancel = PendingIntent.getBroadcast(
+                this, 1, Intent(ACTION_CANCEL_DOWNLOAD),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val n = NotificationCompat.Builder(this, DL_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle("正在下载 $name")
+                .setContentText(if (total > 0) "${fmtBytes(done)} / ${fmtBytes(total)}" else fmtBytes(done))
+                .setProgress(100, pct, total <= 0)
+                .setOngoing(true)
+                .addAction(0, "取消", cancel)
+                .build()
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(DL_NOTIFY_ID, n)
+        } catch (_: Exception) {}
+    }
+
+    private fun finishNotification(name: String, path: String) {
+        try {
+            ensureDownloadChannel()
+            val n = NotificationCompat.Builder(this, DL_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setContentTitle("下载完成")
+                .setContentText(path)
+                .setAutoCancel(true)
+                .build()
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(DL_NOTIFY_ID, n)
+        } catch (_: Exception) {}
+    }
+
+    private fun cancelNotification() {
+        try {
+            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(DL_NOTIFY_ID)
+        } catch (_: Exception) {}
+    }
+
+    /** 记住上次连接的电脑地址，冷启动时静默重连（BUG-06）。 */
+    private fun rememberRemote(url: String?) {
+        if (url.isNullOrBlank()) return
+        try {
+            val host = Uri.parse(url).host ?: return
+            if (host == "127.0.0.1" || host == "localhost" || host == "::1") return
+            prefs.edit().putString("lastUrl", url).apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun showLoadTimeout() {
+        errorView?.visibility = android.view.View.VISIBLE
     }
 
     private fun toastMsg(msg: String) {
         webView.evaluateJavascript("window.__toast && window.__toast(${JSONObject.quote(msg)})", null)
     }
 
+    /** 快速探测上次连接的电脑是否还在线（1.5 秒）。 */
+    private fun pingUrl(base: String): Boolean = try {
+        val ping = java.net.URI(base).resolve("/api/ping").toString()
+        val conn = URL(ping).openConnection() as HttpURLConnection
+        conn.connectTimeout = 1500
+        conn.readTimeout = 1500
+        conn.connect()
+        val ok = conn.responseCode == 200
+        conn.disconnect()
+        ok
+    } catch (_: Exception) {
+        false
+    }
+
     /** 轮询本地端口，服务就绪后再加载首页；最多等 6 秒，超时也照样加载（让重试兜底）。 */
+    /**
+     * 加载首页并在失败时重试：WebView 在「刚装完包 / 服务刚起」时偶发停在占位页，
+     * 只 loadUrl 一次会一直转圈，这里最多补 3 次。
+     */
+    private fun loadHomeWithRetry(tries: Int = 0) {
+        if (isFinishing) return
+        val url = homeUrl()
+        android.util.Log.i("DropLinkBoot", "load #" + tries + " " + url)
+        webView.loadUrl(url)
+        if (tries >= 3) return
+        webView.postDelayed({
+            val u = webView.url
+            if (u == null || u.isBlank() || u == "about:blank") {
+                android.util.Log.w("DropLinkBoot", "still blank, retry " + (tries + 1))
+                loadHomeWithRetry(tries + 1)
+            }
+        }, 2500)
+    }
+
     private fun waitServerThenLoad() {
-        Thread {
-            for (i in 0 until 40) {
-                try {
-                    java.net.Socket().use { s ->
-                        s.connect(java.net.InetSocketAddress("127.0.0.1", TransferService.PORT), 150)
-                    }
-                    break
-                } catch (_: Exception) {
-                    try {
-                        Thread.sleep(150)
-                    } catch (_: InterruptedException) {
-                        break
-                    }
-                }
-            }
-            runOnUiThread {
-                if (!isFinishing) webView.loadUrl(homeUrl())
-            }
-        }.apply { isDaemon = true }.start()
+        android.util.Log.i("DropLinkBoot", "defer load")
+        // 不再用「socket 轮询 + 工作线程」：部分 ROM 上该线程会卡住，界面永远停在占位页。
+        // 直接延时加载，失败由 loadHomeWithRetry() 兜底重试。
+        webView.postDelayed({ loadHomeWithRetry() }, 700)
     }
 
     private fun ensurePermissions() {
@@ -335,6 +680,28 @@ class MainActivity : AppCompatActivity() {
     }
 
     inner class Bridge {
+        @JavascriptInterface
+        fun freeBytes(): Long = this@MainActivity.freeBytes()
+
+        /**
+         * 由页面显式发起的下载：交给 Activity 走「确认 → .part → 改名 → 通知」。
+         * 不再依赖 WebView 的 DownloadListener —— 同源 http 附件在不同 WebView 版本上
+         * 行为不一致，会出现「点了没反应、也没有提示」（R-02）。
+         */
+        @JavascriptInterface
+        fun downloadFile(url: String, name: String, mime: String) {
+            if (!trustedPage()) return
+            val u = url.trim()
+            if (!u.startsWith("http://") && !u.startsWith("https://")) return
+            val n = if (name.isBlank()) parseName(null, u) else name.trim()
+            runOnUiThread {
+                pendingUrl = u
+                pendingName = n
+                pendingMime = mime.ifBlank { "application/octet-stream" }
+                if (saveDirUri != null) startDownloadFlow() else pickDirLauncher.launch(null)
+            }
+        }
+
         @JavascriptInterface
         fun getDeviceInfo(): String {
             if (!trustedPage()) return "{}"
@@ -468,7 +835,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onBackPressed() {
-        if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        webView.evaluateJavascript(
+            "(function(){try{return (window.__dlBack && window.__dlBack())?'1':'0'}catch(e){return '0'}})()"
+        ) { r ->
+            if (r != null && r.contains("1")) return@evaluateJavascript
+            if (webView.canGoBack()) webView.goBack() else super.onBackPressed()
+        }
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 旋转后 WebView 的视口不会自己重算，主动触发一次布局与 resize（BUG-07）
+        webView.post {
+            webView.requestLayout()
+            webView.invalidate()
+            webView.evaluateJavascript("window.dispatchEvent(new Event('resize'))", null)
+        }
     }
 
     override fun onResume() {
@@ -482,6 +864,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        try {
+            unregisterReceiver(cancelReceiver)
+        } catch (_: Exception) {}
+        uiHandler.removeCallbacks(loadWatchdog)
         webView.destroy()
         super.onDestroy()
     }

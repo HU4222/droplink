@@ -29,10 +29,14 @@ class HttpServer(
     private val context: Context,
     val port: Int,
     private val rootProvider: () -> File,
+    private val recvProvider: () -> File,
     private val localToken: String,
 ) {
-    /** 根目录动态解析：用户授权「所有文件访问」后无需重启服务即可浏览整个存储。 */
+    /** 浏览根目录：用户授权「所有文件访问」后无需重启服务即可浏览整个存储。 */
     private val rootDir: File get() = rootProvider()
+
+    /** 接收目录：固定为 Download/DropLink，电脑端只能往这里写（BUG-08）。 */
+    private val recvDir: File get() = recvProvider().apply { mkdirs() }
 
     private val pool = Executors.newCachedThreadPool()
     private var serverSocket: ServerSocket? = null
@@ -60,7 +64,8 @@ class HttpServer(
 
     fun start() {
         rootDir.mkdirs()
-        sendDir = File(rootDir, ".droplink-send").apply { mkdirs() }
+        recvDir.mkdirs()
+        sendDir = File(recvDir, ".droplink-send").apply { mkdirs() }
         running = true
         thread(name = "dl-http") {
             try {
@@ -197,18 +202,22 @@ class HttpServer(
             if (path == "/api/list") return sendJson(out, apiList(query["path"]))
             if (path == "/api/roots") return sendJson(out, apiRoots())
             if (path == "/api/download") return apiDownload(query, headers, out)
+            if (path == "/api/zip") return apiZipGet(query, out)
             if (path == "/api/preview") return apiPreview(query, headers, out)
             if (path == "/api/search") return sendJson(out, apiSearch(query["q"]))
             if (path == "/api/clip") return sendJson(out, clipJson())
             if (path == "/api/transfers") return sendJson(out, transfersJson())
-            if (path == "/api/config") return sendJson(out, JSONObject().put("ok", true).put("recv_dir", rootDir.absolutePath))
+            if (path == "/api/config") return sendJson(out, JSONObject().put("ok", true).put("recv_dir", recvDir.absolutePath))
             if (path == "/api/diag") return sendJson(out, diagJson())
             if (path == "/api/networks") return sendJson(out, networksJson())
             if (path == "/api/peers") return sendJson(out, peersJson())
             if (path == "/api/live") return sendJson(out, liveJson())
             if (path == "/api/inbox") return sendJson(out, inboxJson(ip))
             if (path == "/qr.png") return sendQr(query["text"], out)
-            if (path == "/api/icon") return sendQr("DropLink", out)
+            if (path == "/api/icon") {
+                val sz = query["size"]?.toIntOrNull() ?: 192
+                return apiIcon(sz, out)
+            }
             if (path.startsWith("/dl/")) return handleDl(path, headers, out)
             if (path == "/api/ping") return sendJson(out, JSONObject().put("ok", true))
             return serveStatic(path, out)
@@ -225,16 +234,16 @@ class HttpServer(
                     """{"ok":false,"error":"需要配对码","need_login":true}""".toByteArray())
             }
             when (path) {
-                "/api/upload" -> return apiUploadStream(input, contentLength, out, query)
+                "/api/upload" -> return apiUploadStream(input, contentLength, out, query, localUi)
                 "/api/clip" -> return apiClipAdd(data, out)
                 "/api/clip/delete" -> return apiClipDel(data, out)
-                "/api/delete" -> return apiDelete(data, out)
-                "/api/mkdir" -> return apiMkdir(data, out)
-                "/api/rename" -> return apiRename(data, out)
+                "/api/delete" -> return apiDelete(data, out, localUi)
+                "/api/mkdir" -> return apiMkdir(data, out, localUi)
+                "/api/rename" -> return apiRename(data, out, localUi)
                 "/api/zip" -> return apiZip(data, out)
                 "/api/share" -> return apiShare(data, out)
                 "/api/inbox/ack" -> return apiInboxAck(data, out, ip)
-                "/api/config" -> return sendJson(out, JSONObject().put("ok", true).put("recv_dir", rootDir.absolutePath))
+                "/api/config" -> return sendJson(out, JSONObject().put("ok", true).put("recv_dir", recvDir.absolutePath))
             }
         }
 
@@ -260,7 +269,7 @@ class HttpServer(
             .put("platform", "android")
             .put("app", "DropLink")
             .put("version", appVersion())
-            .put("recv_dir", rootDir.absolutePath)
+            .put("recv_dir", recvDir.absolutePath)
             .put("lan_urls", JSONArray(urls))
             .put("qr_target", urls.firstOrNull() ?: "")
             .put("qr_available", true)
@@ -336,8 +345,8 @@ class HttpServer(
 
     private fun apiRoots(): JSONObject {
         val arr = JSONArray()
-        arr.put(JSONObject().put("name", "接收目录").put("path", rootDir.absolutePath).put("kind", "folder"))
-        return JSONObject().put("ok", true).put("roots", arr).put("recv_dir", rootDir.absolutePath)
+        arr.put(JSONObject().put("name", "接收目录").put("path", recvDir.absolutePath).put("kind", "folder"))
+        return JSONObject().put("ok", true).put("roots", arr).put("recv_dir", recvDir.absolutePath)
     }
 
     private fun apiDownload(query: Map<String, String>, headers: Map<String, String>, out: OutputStream) {
@@ -346,10 +355,55 @@ class HttpServer(
         serveFile(f, query["inline"] == "1", out, headers["range"])
     }
 
+    /**
+     * 文本预览：与电脑版 api_preview 保持同一份协议（JSON）。
+     * 之前这里直接下发文件内容，前端按 JSON 解析就得到 undefined（R-01）。
+     */
     private fun apiPreview(query: Map<String, String>, headers: Map<String, String>, out: OutputStream) {
         val f = resolvePath(query["path"])
         if (!f.isFile) return sendJson(out, JSONObject().put("ok", false).put("error", "文件不存在"))
-        serveFile(f, true, out, headers["range"])
+        val size = f.length()
+        val limit = 256 * 1024
+        val raw = try {
+            f.inputStream().use { it.readNBytes(limit) }
+        } catch (e: Exception) {
+            return sendJson(out, JSONObject().put("ok", false).put("error", "读取失败"))
+        }
+        // 前 4 KB 里出现 NUL 就按二进制处理，避免把图片当文本吐给前端
+        if (raw.take(4096).any { it == 0.toByte() }) {
+            return sendJson(out, JSONObject().put("ok", false).put("error", "该文件不是文本文件"))
+        }
+        var text: String? = null
+        for (cs in listOf(Charsets.UTF_8, charset("GB18030"), Charsets.UTF_16)) {
+            val decoded = try {
+                cs.newDecoder().decode(java.nio.ByteBuffer.wrap(raw)).toString()
+            } catch (_: Exception) {
+                continue
+            }
+            text = decoded
+            break
+        }
+        if (text == null) text = String(raw, Charsets.UTF_8)
+        sendJson(out, JSONObject().put("ok", true).put("text", text)
+            .put("truncated", size > limit).put("size", size))
+    }
+
+    /** 应用图标：返回真实的启动图标，而不是二维码（页头 logo 用它）。 */
+    private fun apiIcon(size: Int, out: OutputStream) {
+        try {
+            val resId = context.applicationInfo.icon
+            val src = android.graphics.BitmapFactory.decodeResource(context.resources, resId)
+            if (src == null) return sendJson(out, JSONObject().put("ok", false).put("error", "图标不可用"))
+            val side = size.coerceIn(48, 512)
+            val bmp = android.graphics.Bitmap.createScaledBitmap(src, side, side, true)
+            val buf = ByteArrayOutputStream()
+            bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, buf)
+            if (bmp !== src) bmp.recycle()
+            send(out, 200, "image/png", buf.toByteArray(),
+                mapOf("Cache-Control" to "max-age=86400"))
+        } catch (e: Exception) {
+            sendJson(out, JSONObject().put("ok", false).put("error", "图标不可用"))
+        }
     }
 
     private fun apiSearch(q: String?): JSONObject {
@@ -386,8 +440,11 @@ class HttpServer(
     }
 
     private fun apiClipAdd(data: JSONObject, out: OutputStream) {
-        val text = data.optString("text", "").take(20000)
-        if (text.isEmpty()) return sendJson(out, JSONObject().put("ok", false).put("error", "内容为空"))
+        val text = data.optString("text", "").trim().take(20000)
+        // BUG-05：空白或只有分隔线（——、----）不算内容
+        if (text.isEmpty() || Regex("^[—\\-–_\\s]+$").matches(text)) {
+            return sendJson(out, JSONObject().put("ok", false).put("error", "内容为空"))
+        }
         clipId++
         val item = JSONObject().put("id", clipId).put("ts", System.currentTimeMillis() / 1000).put("text", text)
         clipItems.add(0, item)
@@ -503,15 +560,18 @@ class HttpServer(
         return JSONObject().put("ok", true).put("port", port).put("networks", arr)
     }
 
-    private fun apiDelete(data: JSONObject, out: OutputStream) {
+    /** 手机本机界面可以操作整机；局域网来的电脑只能改接收目录（BUG-08）。 */
+    private fun writeRoot(localUi: Boolean): File = if (localUi) rootDir else recvDir
+
+    private fun apiDelete(data: JSONObject, out: OutputStream, localUi: Boolean) {
         val paths = data.optJSONArray("paths")
         if (paths == null) return sendJson(out, JSONObject().put("ok", false).put("error", "缺少路径"))
         var all = true
         var blocked = 0
         for (i in 0 until paths.length()) {
             // 严格解析：不在根目录内的路径返回 null（以前会回退成根目录，等于把整个接收目录删掉）
-            val f = resolvePathStrict(paths.optString(i))
-            if (f == null || f.canonicalPath == rootDir.canonicalPath) {
+            val f = resolveWritePath(paths.optString(i), localUi)
+            if (f == null || f.canonicalPath == writeRoot(localUi).canonicalPath) {
                 blocked++
                 all = false
                 continue
@@ -521,11 +581,11 @@ class HttpServer(
         sendJson(out, JSONObject().put("ok", all).put("blocked", blocked))
     }
 
-    /** 只允许根目录内部的路径；越界返回 null。 */
-    private fun resolvePathStrict(target: String?): File? {
+    /** 只允许写入根内部的路径；越界返回 null。 */
+    private fun resolveWritePath(target: String?, localUi: Boolean): File? {
         if (target.isNullOrBlank()) return null
         val f = File(target)
-        val root = rootDir.canonicalPath + File.separator
+        val root = writeRoot(localUi).canonicalPath + File.separator
         val p = try {
             f.canonicalPath
         } catch (e: Exception) {
@@ -534,23 +594,74 @@ class HttpServer(
         return if (p.startsWith(root)) f else null
     }
 
-    private fun apiMkdir(data: JSONObject, out: OutputStream) {
+    private fun apiMkdir(data: JSONObject, out: OutputStream, localUi: Boolean) {
         val name = safeName(data.optString("name"))
-        val parent = resolvePath(data.optString("path"))
+        val parent = resolveWritePath(data.optString("path"), localUi) ?: writeRoot(localUi)
         val ok = File(parent, name).mkdirs()
         sendJson(out, JSONObject().put("ok", ok))
     }
 
-    private fun apiRename(data: JSONObject, out: OutputStream) {
-        val from = resolvePath(data.optString("path"))
+    private fun apiRename(data: JSONObject, out: OutputStream, localUi: Boolean) {
+        val from = resolveWritePath(data.optString("path"), localUi)
+        if (from == null || !from.exists()) return sendJson(out, JSONObject().put("ok", false).put("error", "文件不存在"))
         val to = File(from.parentFile, safeName(data.optString("name")))
         val ok = from.renameTo(to)
         sendJson(out, JSONObject().put("ok", ok))
     }
 
+    /** GET /api/zip：直接流式返回 zip，交给 WebView 的下载器保存（BUG-02）。 */
+    private fun apiZipGet(query: Map<String, String>, out: OutputStream) {
+        val arr = try {
+            JSONArray(query["paths"] ?: "[]")
+        } catch (e: Exception) {
+            JSONArray()
+        }
+        val files = mutableListOf<File>()
+        var total = 0L
+        for (i in 0 until arr.length()) {
+            val f = resolvePath(arr.optString(i))
+            if (!f.exists()) continue
+            files.add(f)
+            total += if (f.isFile) f.length() else 0L
+        }
+        if (files.isEmpty()) {
+            return sendJson(out, JSONObject().put("ok", false).put("error", "没有可打包的文件"))
+        }
+        if (total > (8L shl 30)) {
+            return sendJson(out, JSONObject().put("ok", false).put("error", "打包内容超过 8 GB，请分批下载"))
+        }
+        val name = "DropLink_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+            .format(java.util.Date()) + ".zip"
+        out.write("HTTP/1.1 200 OK\r\n".toByteArray())
+        out.write("Content-Type: application/zip\r\n".toByteArray())
+        out.write(("Content-Disposition: attachment; filename=\"" + name +
+                "\"; filename*=UTF-8''" + java.net.URLEncoder.encode(name, "UTF-8") + "\r\n").toByteArray())
+        out.write("Cache-Control: no-store\r\n".toByteArray())
+        out.write("Connection: close\r\n\r\n".toByteArray())
+        val zos = java.util.zip.ZipOutputStream(BufferedOutputStream(out))
+        fun add(file: File, base: String) {
+            if (file.isDirectory) {
+                zos.putNextEntry(java.util.zip.ZipEntry("$base/"))
+                zos.closeEntry()
+                file.listFiles()?.forEach { add(it, "$base/${it.name}") }
+            } else {
+                zos.putNextEntry(java.util.zip.ZipEntry(base))
+                file.inputStream().use { it.copyTo(zos) }
+                zos.closeEntry()
+            }
+        }
+        try {
+            for (f in files) add(f, f.name)
+            zos.finish()
+            zos.flush()
+        } catch (_: Exception) {
+            // 客户端中断时忽略
+        }
+    }
+
     private fun apiZip(data: JSONObject, out: OutputStream) {
         val paths = data.optJSONArray("paths") ?: return sendJson(out, JSONObject().put("ok", false))
-        val zipFile = File(rootDir, "打包_${System.currentTimeMillis()}.zip")
+        val zipFile = File(context.cacheDir, "打包_${System.currentTimeMillis()}.zip")
         try {
             java.util.zip.ZipOutputStream(BufferedOutputStream(zipFile.outputStream())).use { zos ->
                 fun add(file: File, base: String) {
@@ -596,16 +707,18 @@ class HttpServer(
         return sendDlPage(entry.path, token, out)
     }
 
-    private fun apiUploadStream(input: java.io.InputStream, contentLength: Int, out: OutputStream, query: Map<String, String>) {
+    private fun apiUploadStream(input: java.io.InputStream, contentLength: Int, out: OutputStream,
+                                query: Map<String, String>, localUi: Boolean) {
         val name = safeName(query["name"] ?: "file")
         // 文件夹传输：rel 为相对接收目录的多级路径，逐段净化后创建
         val rel = (query["rel"] ?: "").replace('\\', '/')
         val parts = rel.split('/').filter { it.isNotBlank() && it != "." && it != ".." }.map { safeName(it) }
-        val dir = if (parts.isEmpty()) rootDir else File(rootDir, parts.joinToString(File.separator))
+        val baseDir = if (localUi) rootDir else recvDir
+        val dir = if (parts.isEmpty()) baseDir else File(baseDir, parts.joinToString(File.separator))
         if (!dir.exists() && !dir.mkdirs()) {
             return sendJson(out, JSONObject().put("ok", false).put("error", "无法创建目录"))
         }
-        if (!dir.canonicalPath.startsWith(rootDir.canonicalPath)) {
+        if (!dir.canonicalPath.startsWith(baseDir.canonicalPath)) {
             return sendJson(out, JSONObject().put("ok", false).put("error", "只能上传到接收目录"))
         }
         val dest = uniqueFile(dir, name)

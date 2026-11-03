@@ -157,14 +157,32 @@
     }, ms);
   }
 
-  function triggerDownload(url) {
+  // 安卓原生桥在，就交给它：确认弹窗、.part、改名、通知整条链路都由原生实现。
+  // 浏览器里（电脑本机界面）继续用 <a download>。
+  function nativeBridge() {
+    const b = window.androidBridge;
+    return b && typeof b.downloadFile === 'function' ? b : null;
+  }
+
+  function triggerDownload(url, name) {
+    const bridge = nativeBridge();
+    if (bridge && name) {
+      try {
+        // 桥只接受绝对地址；dlUrl() 给的是 /api/download?...，先按当前页面解析
+        bridge.downloadFile(new URL(url, location.href).href, name, '');
+        return true;
+      } catch (e) {
+        // 桥调用失败就退回浏览器下载，不要让按钮变成死的
+      }
+    }
     const a = document.createElement('a');
     a.href = url;
-    a.download = '';
+    a.download = name || '';
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
     setTimeout(() => a.remove(), 1000);
+    return false;
   }
 
   const dlUrl = (p, log = true) =>
@@ -772,9 +790,36 @@
     if (['image', 'video', 'audio', 'pdf', 'text'].includes(kind)) {
       showPreview(entry);
     } else {
-      triggerDownload(dlUrl(entry.path));
-      toast('开始下载');
+      // BUG-04：不能预览的类型不再「单击即静默下载」，先给操作单让用户明确选择
+      showUnknownSheet(entry);
     }
+  }
+
+  /** 无法预览的文件：显示大小 + 下载 / 分享 / 取消，避免误触和重复下载。 */
+  function showUnknownSheet(e) {
+    state.sheetEntry = e;
+    sheetFrame(`
+      <div class="sheet-head">
+        <div class="thumb k-${e.kind}">${ico(KIND_ICON[e.kind] || 'file')}</div>
+        <div class="sheet-title">
+          <b>${esc(e.name)}</b>
+          <span>${fmtSize(e.size)} · ${fmtTime(e.mtime)}</span>
+        </div>
+        <button class="icon-btn" data-act="closeSheet">${ico('close')}</button>
+      </div>
+      <div class="sheet-body">
+        <div class="empty">
+          ${ico('file')}
+          <b>这种文件无法预览</b>
+          <span>可以下载到手机，或生成扫码分享链接。</span>
+        </div>
+      </div>
+      <div class="sheet-actions">
+        <button class="btn btn-primary" data-act="sheetDownload">${ico('down')}下载</button>
+        <button class="btn" data-act="sheetShare">${ico('qr')}分享</button>
+        <button class="btn btn-plain" data-act="closeSheet">取消</button>
+      </div>
+    `);
   }
 
   function sheetFrame(inner) {
@@ -794,8 +839,12 @@
   function showPreview(e) {
     state.sheetEntry = e;
     const inline = `/api/download?inline=1&path=${encodeURIComponent(e.path)}`;
+    const isEmpty = !e.size;
     let body = '';
-    if (e.kind === 'image') body = `<img class="preview" src="${inline}" alt="">`;
+    if (isEmpty) {
+      // BUG-10：0 字节文件给出明确空态，而不是一个空白框
+      body = `<div class="empty">${ico('file')}<b>文件为空（0 B）</b><span>这个文件没有任何内容可以预览。</span></div>`;
+    } else if (e.kind === 'image') body = `<img class="preview" src="${inline}" alt="">`;
     else if (e.kind === 'video') body = `<video src="${inline}" controls playsinline preload="metadata"></video>`;
     else if (e.kind === 'audio') body = `<audio src="${inline}" controls></audio>`;
     else if (e.kind === 'pdf') body = `<iframe src="${inline}" title="PDF"></iframe>`;
@@ -813,13 +862,13 @@
       <div class="sheet-body">${body}</div>
       <div class="sheet-actions">
         <button class="btn btn-primary" data-act="sheetDownload">${ico('down')}下载</button>
-        <button class="btn" data-act="sheetShare">${ico('qr')}分享</button>
+        <button class="btn" data-act="sheetShare" ${isEmpty ? 'disabled title="空文件无需分享"' : ''}>${ico('qr')}分享</button>
         ${state.session && state.session.local ? `<button class="btn" data-act="sheetOpenLocal">${ico('folderOpen')}在电脑打开</button>` : ''}
         <button class="btn btn-plain" data-act="closeSheet">关闭</button>
       </div>
     `);
 
-    if (e.kind === 'text') {
+    if (!isEmpty && e.kind === 'text') {
       api(`/api/preview?path=${encodeURIComponent(e.path)}`).then((d) => {
         const el = $('#textPreview');
         if (el) el.textContent = d.text + (d.truncated ? '\n\n…（仅显示前 256 KB）' : '');
@@ -831,6 +880,7 @@
   }
 
   async function shareEntry(e) {
+    if (!e.size) { toast('空文件无需分享', true); return; }
     try {
       const body = { path: e.path };
       if (state.selectedIp) body.host = state.selectedIp;  // 用选中的网络生成链接
@@ -1836,7 +1886,11 @@
         break;
       case 'closeSheet': closeSheet(); break;
       case 'sheetDownload':
-        if (state.sheetEntry) { triggerDownload(dlUrl(state.sheetEntry.path)); toast('开始下载'); }
+        if (state.sheetEntry) {
+          if (!confirmLarge(state.sheetEntry.size, '下载')) break;
+          const started = triggerDownload(dlUrl(state.sheetEntry.path), state.sheetEntry.name);
+          if (!started) toast(state.sheetEntry.size ? '开始下载' : '空文件：仅创建一个 0 字节文件');
+        }
         break;
       case 'sheetShare':
         if (state.sheetEntry) shareEntry(state.sheetEntry);
@@ -1968,14 +2022,15 @@
       case 'selDownload': {
         const items = Array.from(state.sel.values()).filter((x) => !x.dir);
         if (!items.length) { toast('请选择文件'); break; }
-        if (items.length === 1) triggerDownload(dlUrl(items[0].path));
-        else zipSelected(items.map((x) => x.path));
+        if (items.length === 1) {
+          if (confirmLarge(items[0].size, '下载')) triggerDownload(dlUrl(items[0].path), items[0].name);
+        } else zipSelected(items);
         break;
       }
       case 'selZip': {
         const items = Array.from(state.sel.values());
         if (!items.length) { toast('请选择内容'); break; }
-        zipSelected(items.map((x) => x.path));
+        zipSelected(items.filter((x) => !x.dir));
         break;
       }
       case 'selDelete': deleteSelected(); break;
@@ -2017,6 +2072,14 @@
     if (ev.key === 'Enter' && !$('#login').hidden) doLogin();
   });
 
+  /* 安卓返回键先交给页面：返回 true 表示已消费（关弹层/退出多选/关搜索）。 */
+  window.__dlBack = function () {
+    if (!$('#sheet').hidden) { closeSheet(); return true; }
+    if (state.selectMode) { exitSelect(); return true; }
+    if (state.searchOpen) { closeSearch(); return true; }
+    return false;
+  };
+
   // 网络切换下拉
   document.addEventListener('change', (ev) => {
     if (ev.target && ev.target.id === 'netSelect') {
@@ -2033,19 +2096,29 @@
     $('#loginError').textContent = '';
   });
 
+  function clipTextOk(v) {
+    // 只有空白或只有分隔线（—— / ----）都算空内容，避免生成垃圾记录
+    return !!v && !/^[—\-–_\s]+$/.test(v);
+  }
+
   $('#clipInput').addEventListener('input', (ev) => {
-    $('#clipCount').textContent = `${ev.target.value.length} 字`;
+    const v = ev.target.value;
+    $('#clipCount').textContent = `${v.length} 字`;
+    const btn = document.querySelector('[data-act="clipSend"]');
+    if (btn) btn.disabled = !clipTextOk(v.trim());
   });
 
   function sendClip() {
     const el = $('#clipInput');
     const text = el.value.trim();
-    if (!text) { toast('内容为空', true); return; }
+    if (!clipTextOk(text)) { toast('请输入内容', true); return; }
     const from = state.session && state.session.local ? '电脑' : '手机';
     api('/api/clip', { method: 'POST', body: JSON.stringify({ text, from }) })
       .then(() => {
         el.value = '';
         $('#clipCount').textContent = '0 字';
+        const btn = document.querySelector('[data-act="clipSend"]');
+        if (btn) btn.disabled = true;
         toast('已发送');
         loadClip();
       })
@@ -2054,32 +2127,49 @@
 
   /* ---------------- 多选操作 ---------------- */
 
-  function zipSelected(paths) {
-    if (!paths.length) return;
-    toast('正在打包…');
-    fetch('/api/zip', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: Object.assign({ 'Content-Type': 'application/json' },
-        DL_TOKEN ? { 'X-DL-Token': DL_TOKEN } : {}),
-      body: JSON.stringify({ paths }),
-    }).then(async (res) => {
-      if (!res.ok) {
-        let msg = '打包失败';
-        try { msg = (await res.json()).error || msg; } catch (e) { /* ignore */ }
-        throw new Error(msg);
-      }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `DropLink_${Date.now()}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-      toast('打包完成');
-    }).catch((e) => toast(e.message, true));
+  /** 安卓桥能拿到剩余空间；桌面浏览器没有这个能力就返回 0。 */
+  function freeBytes() {
+    try {
+      const b = window.androidBridge;
+      if (b && b.freeBytes) return Number(b.freeBytes()) || 0;
+    } catch (e) { /* ignore */ }
+    return 0;
+  }
+
+  /** 大文件/批量操作前确认；返回 true 表示继续。 */
+  function confirmLarge(size, action) {
+    const free = freeBytes();
+    if (!size || size < (1 << 30)) return true;
+    let msg = `${action} ${fmtSize(size)} 的文件？`;
+    if (free) msg += `\n手机剩余空间 ${fmtSize(free)}`;
+    if (free && size > free) msg += '\n\n剩余空间不足，可能写到一半失败。';
+    return confirm(msg);
+  }
+
+  function zipSelected(items) {
+    if (!items.length) { toast('没有可打包的文件', true); return; }
+    const free = freeBytes();
+    const HUGE = 2 * 1024 * 1024 * 1024;   // 2 GiB；JS 的 2<<30 会溢出成负数
+    const huge = items.filter((x) => (x.size || 0) > HUGE);
+    let chosen = items;
+    if (huge.length) {
+      // 超过 2 GB 的文件不参与打包：既避免服务端 8 GB 上限，也避免长时间卡住
+      chosen = items.filter((x) => (x.size || 0) <= HUGE);
+      if (!chosen.length) { toast('选中的文件都超过 2 GB，请单独下载', true); return; }
+      if (!confirm(`有 ${huge.length} 个文件超过 2 GB，将跳过它们，只打包其余 ${chosen.length} 个。\n\n继续？`)) return;
+    }
+    if (chosen.length > 100) { toast('一次最多打包 100 项，请分批操作', true); return; }
+    const total = chosen.reduce((s, x) => s + (x.size || 0), 0);
+    let msg = `打包 ${chosen.length} 个文件，共 ${fmtSize(total)}？`;
+    if (free) msg += `\n手机剩余空间 ${fmtSize(free)}`;
+    if (free && total > free) msg += '\n\n剩余空间可能不足。';
+    if (!confirm(msg)) return;
+
+    // 走导航下载而不是 fetch+blob：安卓 WebView 的 DownloadListener 只认 http 地址，
+    // blob 地址会「点了没反应」，这也是之前误触后直接下载原文件的原因之一。
+    const url = '/api/zip?paths=' + encodeURIComponent(JSON.stringify(chosen.map((x) => x.path)));
+    triggerDownload(url);
+    toast('正在打包，稍候…');
   }
 
   async function deleteSelected() {

@@ -252,7 +252,13 @@ svg { display: block; }
 
 /* ---------------- 视图 ---------------- */
 
-.views { flex: 1; padding: 0 16px calc(96px + env(safe-area-inset-bottom)); }
+.btn:disabled, .btn[disabled] {
+  opacity: .45;
+  filter: grayscale(.35);
+  pointer-events: none;
+}
+
+.views { flex: 1; padding: 0 16px calc(118px + env(safe-area-inset-bottom)); }
 @media (min-width: 980px) {
   .views { padding: 0 30px 48px; }
 }
@@ -1077,3 +1083,14 @@ body.tips-off .inline-tip { display: none; }
     transition-duration: .001ms !important;
   }
 }
+
+/* 横屏/矮屏：避免弹层与底部导航超出可视区（BUG-07） */
+@media (orientation: landscape) and (max-height: 620px) {
+  .topbar { padding-top: 8px; padding-bottom: 8px; }
+  .nav { padding-bottom: calc(2px + env(safe-area-inset-bottom)); }
+  .sheet-card { max-height: 96dvh; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+  .sheet-body img.preview, .sheet-body video, .sheet-body iframe { max-height: 52dvh; }
+}
+
+/* 长列表：只渲染视口附近的行，1 万项时滚动不卡（报告 C 节） */
+.row { content-visibility: auto; contain-intrinsic-size: auto 74px; }
