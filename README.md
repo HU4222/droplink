@@ -20,11 +20,12 @@
 |---|---|---|---|
 | **Windows 10 / 11** | [`DropLink.exe`](https://github.com/HU4222/droplink/releases/latest/download/DropLink.exe) | ~14 MB | Single portable executable, no install, no Python needed |
 | **Android 8.0+** | [`DropLink-Android.apk`](https://github.com/HU4222/droplink/releases/latest/download/DropLink-Android.apk) | ~1.2 MB | Sideload; "Install unknown apps" must be allowed |
+| **iPhone / iPad / HarmonyOS** | — no install — | — | Open the address shown on the desktop in any browser; everything except background resume and notification actions works the same |
 | Checksums | [`SHA256SUMS.txt`](https://github.com/HU4222/droplink/releases/latest/download/SHA256SUMS.txt) | 1 KB | Verify your download |
 
 Full changelog: [`CHANGELOG.md`](CHANGELOG.md) · All builds: [Releases](https://github.com/HU4222/droplink/releases)
 
-> **中文**：电脑版是**单文件绿色版**，双击即用，不需要装 Python；安卓版是原生 App，需要允许「安装未知来源应用」。下载后可以用 SHA256SUMS.txt 核对文件完整性。历史版本都在 Releases 页面。
+> **中文**：电脑版是**单文件绿色版**，双击即用，不需要装 Python；安卓版是原生 App，需要允许「安装未知来源应用」；iPhone / iPad / 鸿蒙 **不用安装**，浏览器打开电脑端显示的地址即可。传输走局域网直连，不经过任何中转服务器。下载后可以用 SHA256SUMS.txt 核对文件完整性，历史版本都在 Releases 页面。
 
 ---
 
