@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#4f46e5">
+<meta name="color-scheme" content="light dark">
 <meta name="author" content="HU4222">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
@@ -11,13 +12,19 @@
 <meta name="apple-mobile-web-app-title" content="DropLink">
 <meta name="format-detection" content="telephone=no">
 <link rel="manifest" href="/manifest.webmanifest">
-<link rel="apple-touch-icon" href="/api/icon?size=192&v=2">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v=1">
 <link rel="icon" type="image/png" href="/api/icon?size=64&v=2">
 <link rel="shortcut icon" type="image/png" href="/api/icon?size=64&v=2">
-<link rel="stylesheet" href="/static/styles.css?v=14">
+<link rel="stylesheet" href="/static/styles.css?v=16">
 <title>DropLink 互传</title>
 </head>
 <body>
+
+<div class="compat-tip" id="compatTip" role="status" hidden>
+  <div class="compat-tip-txt" id="compatTipText"></div>
+  <button class="compat-tip-x" id="compatTipClose" type="button" aria-label="关闭提示">知道了</button>
+  <i class="compat-tip-bar" aria-hidden="true"></i>
+</div>
 
 <div class="app">
   <!-- 侧栏 / 底部导航 -->
@@ -74,7 +81,7 @@
     <main class="views">
       <!-- ============ 浏览 ============ -->
       <section class="view is-active" id="view-browse">
-        <div class="inline-tip"><b>怎么用：</b>点文件夹进入、点文件预览；长按或点「选择」可多选，再打包下载。手机传来的文件在<b>「DropLink 接收」</b>文件夹。<b>连不上？</b>看右上角状态，或到「我的」→「检测连接问题」。</div>
+        <div class="inline-tip"><b>怎么用：</b>点文件夹进入、点文件预览；长按或点「选择」可多选，再打包下载。发送端传来的文件在<b>「DropLink 接收」</b>文件夹。<b>连不上？</b>看右上角状态，或到「我的」→「检测连接问题」。</div>
 
         <div class="crumbs" id="crumbs"></div>
 
@@ -107,9 +114,15 @@
       <section class="view" id="view-send">
         <div class="hero">
           <h1>把文件丢过来</h1>
-          <p>手机 ↔ 电脑，同一个 Wi-Fi 内直连传输，不经过互联网。</p>
+          <p>发送端 ↔ 接收端，同一个 Wi-Fi 内直连传输，不经过互联网。</p>
         </div>
-        <div class="inline-tip"><b>怎么用：</b>把文件拖到下面，或点「选择文件」上传到电脑；手机端在「传文件」页也能传。<b>传不动？</b>确认手机已配对（右上角状态），或「我的」→「检测连接问题」。</div>
+        <div class="inline-tip"><b>怎么用：</b>把文件拖到下面，或点「选择文件」上传到接收端；对端在「传文件」页也能传。<b>传不动？</b>确认对端已配对（右上角状态），或「我的」→「检测连接问题」。</div>
+
+        <!-- 下载队列（安卓端：队列/续传/暂停；桌面端不显示） -->
+        <div class="dlq hidden" id="dlQueue">
+          <div class="dlq-head"><b>下载队列</b><span id="dlqCount"></span></div>
+          <div class="dlq-list" id="dlqList"></div>
+        </div>
 
         <!-- 传输中心 · 实时可视化 -->
         <div class="viz-card" id="vizCard">
@@ -127,7 +140,7 @@
                   <rect x="7" y="2.5" width="10" height="19" rx="2.6"/><path d="M10.8 18.6h2.4"/>
                 </svg>
               </div>
-              <span>手机</span>
+              <span>发送端</span>
             </div>
             <div class="viz-node node-pc">
               <div class="node-ring"></div>
@@ -136,7 +149,7 @@
                   <rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M2 20h20"/>
                 </svg>
               </div>
-              <span>电脑</span>
+              <span>接收端</span>
             </div>
             <div class="viz-burst" id="vizBurst">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m4 12.5 5 5L20 6.5"/></svg>
@@ -162,10 +175,10 @@
           <div id="liveBox" class="queue"></div>
         </div>
 
-        <!-- 电脑端：发送文件到手机 -->
+        <!-- 本机 → 对端：发送文件 -->
         <div class="card" id="sendPanel" hidden>
-          <h3>发送文件到手机</h3>
-          <p class="muted" style="font-size:12.5px;margin:0 0 12px">选择电脑上的文件，推送到已连接的手机。</p>
+          <h3>发送到对端</h3>
+          <p class="muted" style="font-size:12.5px;margin:0 0 12px">选择本机文件，推送到已连接的对端。</p>
           <div class="send-files" id="sendFileList"></div>
           <button class="btn btn-primary" data-act="pickSendFiles">选择文件</button>
 
@@ -183,7 +196,7 @@
           <div class="dz-icon">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="m6 10 6-6 6 6"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
           </div>
-          <div class="dz-text"><b>选择文件上传到电脑</b><span id="dzHint">也可以把文件拖到这里</span></div>
+          <div class="dz-text"><b>选择文件上传到接收端</b><span id="dzHint">也可以把文件拖到这里</span></div>
           <div class="dz-actions">
             <button class="btn btn-primary" data-act="pickFiles">选择文件</button>
             <button class="btn" data-act="pickPhotos">照片/视频</button>
@@ -213,7 +226,7 @@
 
         <div class="tip-card">
           <b>省流量小贴士</b>
-          <p>只要手机和电脑连在同一个路由器的 Wi-Fi，或电脑开启「移动热点」让手机连上，传输就只走局域网，不消耗手机移动数据，也不需要互联网。</p>
+          <p>只要发送端和接收端连在同一个路由器的 Wi-Fi，或接收端开启「移动热点」让发送端连上，传输就只走局域网，不消耗移动数据，也不需要互联网。</p>
         </div>
       </section>
 
@@ -241,9 +254,10 @@
       <section class="view" id="view-about">
         <div class="hero">
           <h1>连接信息</h1>
-          <p>手机与电脑在同一网络内即可互传，全程不经过服务器。</p>
+          <p>发送端与接收端在同一网络内即可互传，全程不经过服务器。</p>
+          <p class="muted" style="font-size:12.5px;margin:6px 0 0">「发送端」= 发送文件的一端　「接收端」= 接收文件、保存文件的一端。</p>
         </div>
-        <div class="inline-tip"><b>怎么用：</b>这里看二维码、地址和配对码；电脑有多个网卡时可在「切换网络」里选对手机连的那个。<b>连不上？</b>点「检测连接问题」一步步排查。</div>
+        <div class="inline-tip"><b>怎么用：</b>这里看二维码、地址和配对码；接收端有多个网卡时可在「切换网络」里选对发送端连的那个。<b>连不上？</b>点「检测连接问题」一步步排查。</div>
         <div id="aboutBody"></div>
       </section>
     </main>
@@ -267,12 +281,12 @@
     <div class="login-logo">
       <img src="/api/icon?size=96" alt="DropLink" width="96" height="96">
     </div>
-    <h1>连接到电脑</h1>
-    <p class="muted">输入电脑屏幕上显示的 6 位配对码</p>
+    <h1>连接到接收端</h1>
+    <p class="muted">输入接收端屏幕上显示的 6 位配对码</p>
     <input id="pinInput" class="pin-input" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="one-time-code" placeholder="······">
     <div class="login-error" id="loginError"></div>
     <button class="btn btn-primary btn-block" data-act="login">连接</button>
-    <p class="login-foot">电脑上运行「启动.bat」后，窗口里会显示配对码。<br>仅同一局域网内可用，不消耗流量。</p>
+    <p class="login-foot">在 Windows 接收端运行「启动.bat」后，窗口里会显示配对码。<br>仅同一局域网内可用，不消耗流量。</p>
   </div>
 </div>
 
@@ -295,22 +309,22 @@
         <div class="guide-ico">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="6" width="8.5" height="12" rx="2"/><path d="M6.5 16.5h.01"/><rect x="13" y="3.5" width="8.5" height="17" rx="2"/><path d="M17 18.5h.01"/><path d="M11 12h2M9.5 12h0"/></svg>
         </div>
-        <h2>手机和电脑，直接传文件</h2>
-        <p>同一个 Wi-Fi 内直连，<b>不经过互联网、不上传云端、不消耗手机流量</b>，速度比网盘快得多。</p>
+        <h2>发送端和接收端，直接传文件</h2>
+        <p>同一个 Wi-Fi 内直连，<b>不经过互联网、不上传云端、不消耗移动流量</b>，速度比网盘快得多。</p>
       </div>
       <div class="guide-slide" data-gstep="1">
         <div class="guide-ico">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8.5a14 14 0 0 1 19 0"/><path d="M5.5 12a9.5 9.5 0 0 1 13 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/></svg>
         </div>
-        <h2>先把手机连上来</h2>
-        <p>让手机连上和电脑<b>同一个 Wi-Fi</b>，扫「我的」页里的二维码；或让手机浏览器打开那个地址，输入 <b>6 位配对码</b>。</p>
+        <h2>先把发送端连上来</h2>
+        <p>让发送端连上和接收端<b>同一个 Wi-Fi</b>，扫「我的」页里的二维码；或让发送端浏览器打开那个地址，输入 <b>6 位配对码</b>。</p>
       </div>
       <div class="guide-slide" data-gstep="2">
         <div class="guide-ico">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v11"/><path d="m7.5 9.5 4.5 4.5 4.5-4.5"/><path d="M4 17v1.5A2.5 2.5 0 0 0 6.5 21h11a2.5 2.5 0 0 0 2.5-2.5V17"/></svg>
         </div>
         <h2>两边怎么互传</h2>
-        <p>手机：在「浏览」里看、下载电脑文件，「传文件」上传照片和视频。电脑：把文件拖进来，或点文件「分享」让手机扫码下载。文字、链接走「剪贴板」。</p>
+        <p>发送端：在「浏览」里看、下载接收端上的文件，「传文件」上传照片和视频。接收端：把文件拖进来，或点文件「分享」生成链接，让对方扫码下载。文字、链接走「剪贴板」。</p>
       </div>
     </div>
     <div class="guide-dots" id="guideDots"><i class="is-on"></i><i></i><i></i></div>
@@ -328,6 +342,6 @@
 <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
 <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
 
-<script src="/static/app.js?v=14"></script>
+<script src="/static/app.js?v=16"></script>
 </body>
 </html>

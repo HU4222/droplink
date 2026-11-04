@@ -430,7 +430,7 @@ class HttpServer(
         val token = java.util.UUID.randomUUID().toString().replace("-", "")
         sessions[token] = System.currentTimeMillis()
         if (!localUi) {
-            val name = data.optString("name", "手机设备").take(40)
+            val name = data.optString("name", "未知设备").take(40)
             peers[ip] = JSONObject().put("ts", System.currentTimeMillis()).put("name", name)
         }
         val cookie = "dlsess=$token; Path=/; Max-Age=2592000; HttpOnly; SameSite=Strict"
@@ -478,7 +478,7 @@ class HttpServer(
     private fun peersJson(): JSONObject {
         val arr = JSONArray()
         peers.entries.sortedByDescending { it.value.optLong("ts") }.forEach { (ip, v) ->
-            arr.put(JSONObject().put("ip", ip).put("ts", v.optLong("ts") / 1000).put("name", v.optString("name", "手机设备")))
+            arr.put(JSONObject().put("ip", ip).put("ts", v.optLong("ts") / 1000).put("name", v.optString("name", "未知设备")))
         }
         return JSONObject().put("ok", true).put("peers", arr)
     }
@@ -560,7 +560,7 @@ class HttpServer(
         return JSONObject().put("ok", true).put("port", port).put("networks", arr)
     }
 
-    /** 手机本机界面可以操作整机；局域网来的电脑只能改接收目录（BUG-08）。 */
+    /** 本机界面可以操作整机；局域网来的源端只能改接收目录（BUG-08）。 */
     private fun writeRoot(localUi: Boolean): File = if (localUi) rootDir else recvDir
 
     private fun apiDelete(data: JSONObject, out: OutputStream, localUi: Boolean) {
@@ -898,7 +898,7 @@ class HttpServer(
             <path d='M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2'/></svg></div>
             <h1>来自对方设备的文件</h1><p class='name'>$name</p><p class='meta'>$human · 点击下方按钮下载</p>
             <a class='btn' href='/dl/$token/file'>下载</a>
-            <p class='tip'>文件会保存到手机浏览器的「下载」目录。</p></div></body></html>
+            <p class='tip'>文件会保存到本机浏览器的「下载」目录。</p></div></body></html>
         """.trimIndent()
         send(out, 200, "text/html; charset=utf-8", html.toByteArray())
     }

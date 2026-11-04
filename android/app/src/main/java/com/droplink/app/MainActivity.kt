@@ -62,18 +62,10 @@ class MainActivity : AppCompatActivity() {
     // 下载保存目录（SAF）与待下载任务
     private var saveDirUri: Uri? = null
     private val prefs by lazy { getSharedPreferences("droplink", MODE_PRIVATE) }
-    @Volatile private var downloadCancelled = false
-    @Volatile private var downloading = false
     private var errorView: TextView? = null
     private val uiHandler = Handler(Looper.getMainLooper())
     private val loadWatchdog = Runnable { showLoadTimeout() }
 
-    /** 通知栏「取消」按钮：把当前下载标记为取消，下载线程会删掉 .part。 */
-    private val cancelReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == ACTION_CANCEL_DOWNLOAD) downloadCancelled = true
-        }
-    }
     private var pendingUrl: String? = null
     private var pendingName: String = "file"
     private var pendingMime: String = "application/octet-stream"
@@ -104,7 +96,6 @@ class MainActivity : AppCompatActivity() {
         const val PICK_REQUEST = 101
         const val PERMISSION_REQUEST = 102
         const val FILE_CHOOSER_REQUEST = 103
-        const val ACTION_CANCEL_DOWNLOAD = "com.droplink.app.CANCEL_DOWNLOAD"
         const val DL_CHANNEL_ID = "droplink-download"
         const val DL_NOTIFY_ID = 2001
 
@@ -130,16 +121,20 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        cleanStaleParts()
         saveDirUri = prefs.getString("saveDir", null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
-        try {
-            val filter = IntentFilter(ACTION_CANCEL_DOWNLOAD)
-            if (Build.VERSION.SDK_INT >= 33) {
-                registerReceiver(cancelReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-            } else {
-                registerReceiver(cancelReceiver, filter)
+
+        // 下载中心：队列 + 续传 + 校验 + 通知动作（1.4.0）
+        DownloadCenter.init(this)
+        DownloadCenter.setListener {
+            runOnUiThread {
+                try {
+                    webView.evaluateJavascript(
+                        "window.onDownloadQueueChanged && window.onDownloadQueueChanged()", null)
+                } catch (_: Exception) {
+                }
             }
-        } catch (_: Exception) {}
+        }
+        DownloadCenter.sweepOrphans()
 
         // 启动前台服务（持有内置 HTTP 服务，保活进程，避免退后台被系统杀掉）
         val svc = Intent(this, TransferService::class.java)
@@ -369,8 +364,8 @@ class MainActivity : AppCompatActivity() {
         val url = pendingUrl ?: return
         val name = pendingName
         val mime = pendingMime
-        if (downloading) {
-            toastMsg("已有下载在进行，请稍候")
+        if (DownloadCenter.activeCount() >= 5) {
+            toastMsg("下载队列已满（5 个），先处理一下再来")
             return
         }
         kotlin.concurrent.thread(isDaemon = true) {
@@ -384,9 +379,17 @@ class MainActivity : AppCompatActivity() {
                     if (size > 0 && free in 1 until size) append("\n\n空间不足，可能写到一半失败。")
                 }
                 AlertDialog.Builder(this)
-                    .setTitle("下载到手机")
+                    .setTitle("下载到本机")
                     .setMessage(msg)
-                    .setPositiveButton("下载") { _, _ -> doDownload(url, name, mime) }
+                    .setPositiveButton("下载") { _, _ ->
+                        val dir = saveDirUri
+                        if (dir == null) {
+                            pickDirLauncher.launch(null)
+                        } else {
+                            DownloadCenter.enqueue(url, name, mime, dir.toString())
+                            toastMsg("已加入下载队列")
+                        }
+                    }
                     .setNegativeButton("取消", null)
                     .show()
             }
@@ -410,180 +413,9 @@ class MainActivity : AppCompatActivity() {
         -1L
     }
 
-    private fun doDownload(url: String, name: String, mime: String) {
-        val dirUri = saveDirUri ?: return
-        downloading = true
-        downloadCancelled = false
-        pendingUrl = null
-        kotlin.concurrent.thread(isDaemon = true) {
-            var part: DocumentFile? = null
-            try {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 15000
-                conn.readTimeout = 60000
-                try {
-                    val cookie = CookieManager.getInstance().getCookie(url)
-                    if (!cookie.isNullOrEmpty()) conn.setRequestProperty("Cookie", cookie)
-                } catch (_: Exception) {}
-                conn.connect()
-                val code = conn.responseCode
-                if (code != 200 && code != 206) {
-                    runOnUiThread { toastMsg("下载失败：服务器返回 $code") }
-                    return@thread
-                }
-                val total = conn.contentLengthLong
-                val tree = DocumentFile.fromTreeUri(this, dirUri)
-                if (tree == null) {
-                    runOnUiThread { toastMsg("无法访问保存目录") }
-                    return@thread
-                }
-                // 同名文件追加 (1)(2)，避免覆盖（BUG-03）
-                val finalName = uniqueName(tree, name)
-                // 先写 .part，完成后改名：中断时不会留下“看起来完整”的半截文件（BUG-02）
-                val partFile = tree.createFile("application/octet-stream", "$finalName.part")
-                if (partFile == null) {
-                    runOnUiThread { toastMsg("无法在该目录创建文件") }
-                    return@thread
-                }
-                part = partFile
-                val os = contentResolver.openOutputStream(partFile.uri)
-                if (os == null) {
-                    runOnUiThread { toastMsg("无法写入文件") }
-                    return@thread
-                }
-                val input = conn.inputStream
-                var done = 0L
-                var lastNotify = 0L
-                val buf = ByteArray(64 * 1024)
-                while (true) {
-                    if (downloadCancelled) break
-                    val n = input.read(buf)
-                    if (n < 0) break
-                    os.write(buf, 0, n)
-                    done += n
-                    val now = System.currentTimeMillis()
-                    if (now - lastNotify > 400) {
-                        lastNotify = now
-                        notifyProgress(name, done, total)
-                    }
-                }
-                os.flush()
-                os.close()
-                input.close()
-                conn.disconnect()
+    // 下载的实现在 DownloadCenter.kt：队列、续传、校验、通知都在那边（1.4.0）。
+    // 这里只保留「确认 → 入队」的交互，避免 Activity 里再出现第二套下载逻辑。
 
-                if (downloadCancelled) {
-                    partFile.delete()
-                    cancelNotification()
-                    runOnUiThread { toastMsg("已取消下载") }
-                    return@thread
-                }
-                val newUri = try {
-                    DocumentsContract.renameDocument(contentResolver, partFile.uri, finalName)
-                } catch (_: Exception) {
-                    null
-                }
-                if (newUri == null) {
-                    cancelNotification()
-                    runOnUiThread { toastMsg("下载完成，但重命名失败：${partFile.name}") }
-                    return@thread
-                }
-                val dirName = tree.name ?: "所选目录"
-                finishNotification(name, "$dirName/$name")
-                runOnUiThread {
-                    toastMsg("已保存到 $dirName/$finalName")
-                    showNotification("$dirName/$finalName", "文件已保存")
-                }
-            } catch (e: Exception) {
-                try {
-                    part?.delete()
-                } catch (_: Exception) {}
-                cancelNotification()
-                runOnUiThread { toastMsg("下载失败：${e.message}") }
-            } finally {
-                downloading = false
-            }
-        }
-    }
-
-    /** 启动时清掉超过 24 小时的 .part 残片（报告 A.2：中断后不该长期占空间）。 */
-    private fun cleanStaleParts() {
-        kotlin.concurrent.thread(isDaemon = true) {
-            try {
-                val dir = File(Environment.getExternalStorageDirectory(), "Download/DropLink")
-                if (!dir.isDirectory) return@thread
-                val deadline = System.currentTimeMillis() - 24L * 3600 * 1000
-                dir.listFiles()?.forEach { f ->
-                    if (f.isFile && f.name.endsWith(".part") && f.lastModified() < deadline) {
-                        f.delete()
-                    }
-                }
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    /** 同名时生成 "名称 (1).扩展名"。 */
-    private fun uniqueName(tree: DocumentFile, name: String): String {
-        if (tree.findFile(name) == null) return name
-        val dot = name.lastIndexOf('.')
-        val base = if (dot > 0) name.substring(0, dot) else name
-        val ext = if (dot > 0) name.substring(dot) else ""
-        var i = 1
-        while (i < 1000) {
-            val candidate = "$base ($i)$ext"
-            if (tree.findFile(candidate) == null) return candidate
-            i++
-        }
-        return "$base-${System.currentTimeMillis()}$ext"
-    }
-
-    private fun ensureDownloadChannel() {
-        if (Build.VERSION.SDK_INT < 26) return
-        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        if (nm.getNotificationChannel(DL_CHANNEL_ID) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(DL_CHANNEL_ID, "文件下载", NotificationManager.IMPORTANCE_LOW))
-        }
-    }
-
-    private fun notifyProgress(name: String, done: Long, total: Long) {
-        try {
-            ensureDownloadChannel()
-            val pct = if (total > 0) ((done * 100) / total).toInt() else 0
-            val cancel = PendingIntent.getBroadcast(
-                this, 1, Intent(ACTION_CANCEL_DOWNLOAD),
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            val n = NotificationCompat.Builder(this, DL_CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle("正在下载 $name")
-                .setContentText(if (total > 0) "${fmtBytes(done)} / ${fmtBytes(total)}" else fmtBytes(done))
-                .setProgress(100, pct, total <= 0)
-                .setOngoing(true)
-                .addAction(0, "取消", cancel)
-                .build()
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(DL_NOTIFY_ID, n)
-        } catch (_: Exception) {}
-    }
-
-    private fun finishNotification(name: String, path: String) {
-        try {
-            ensureDownloadChannel()
-            val n = NotificationCompat.Builder(this, DL_CHANNEL_ID)
-                .setSmallIcon(android.R.drawable.stat_sys_download_done)
-                .setContentTitle("下载完成")
-                .setContentText(path)
-                .setAutoCancel(true)
-                .build()
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).notify(DL_NOTIFY_ID, n)
-        } catch (_: Exception) {}
-    }
-
-    private fun cancelNotification() {
-        try {
-            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(DL_NOTIFY_ID)
-        } catch (_: Exception) {}
-    }
 
     /** 记住上次连接的电脑地址，冷启动时静默重连（BUG-06）。 */
     private fun rememberRemote(url: String?) {
@@ -650,10 +482,8 @@ class MainActivity : AppCompatActivity() {
             checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             need.add(android.Manifest.permission.POST_NOTIFICATIONS)
         }
-        if (Build.VERSION.SDK_INT >= 29 &&
-            checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            need.add(android.Manifest.permission.ACCESS_FINE_LOCATION)
-        }
+        // 1.4.3 起不再申请定位：热点开关走 WifiManager 反射，全程不读 SSID / 扫描结果，
+        // 用不到位置信息（定位权限在 Android 上只服务于「通过 Wi-Fi 反推位置」）。
         if (need.isNotEmpty()) {
             ActivityCompat.requestPermissions(this, need.toTypedArray(), PERMISSION_REQUEST)
         }
@@ -700,6 +530,32 @@ class MainActivity : AppCompatActivity() {
                 pendingMime = mime.ifBlank { "application/octet-stream" }
                 if (saveDirUri != null) startDownloadFlow() else pickDirLauncher.launch(null)
             }
+        }
+
+        /** 队列快照（JSON），供页面显示进度。 */
+        @JavascriptInterface
+        fun downloadQueue(): String = DownloadCenter.snapshotJson()
+
+        /** 队列里还有几个未完成任务。 */
+        @JavascriptInterface
+        fun activeDownloads(): Int = DownloadCenter.activeCount()
+
+        @JavascriptInterface
+        fun pauseDownload(id: String) {
+            if (!trustedPage()) return
+            DownloadCenter.pause(id)
+        }
+
+        @JavascriptInterface
+        fun resumeDownload(id: String) {
+            if (!trustedPage()) return
+            DownloadCenter.resume(id)
+        }
+
+        @JavascriptInterface
+        fun cancelDownload(id: String) {
+            if (!trustedPage()) return
+            DownloadCenter.remove(id)
         }
 
         @JavascriptInterface
@@ -865,7 +721,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         try {
-            unregisterReceiver(cancelReceiver)
         } catch (_: Exception) {}
         uiHandler.removeCallbacks(loadWatchdog)
         webView.destroy()

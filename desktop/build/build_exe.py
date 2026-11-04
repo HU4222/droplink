@@ -159,6 +159,14 @@ def collect_files(pyhome: str, stage: str):
         p = os.path.join(APP, name)
         if os.path.isfile(p):
             out.append(("app/" + name, p))
+
+    # 服务端模块包（1.4.1 起 server.py 拆成 dlcore/*.py）
+    pkg = os.path.join(APP, "dlcore")
+    if os.path.isdir(pkg):
+        for f in sorted(os.listdir(pkg)):
+            if not f.endswith(".py"):
+                continue
+            out.append(("app/dlcore/" + f, os.path.join(pkg, f)))
     web = os.path.join(APP, "web")
     for root, dirs, files in os.walk(web):
         dirs[:] = [d for d in dirs if d != "__pycache__"]
@@ -325,7 +333,10 @@ def main():
         ico_abs = os.path.abspath(ico).replace("\\", "/")
         # 版本资源：CompanyName 是 G-16 要求的署名为之一（资源管理器属性里可见）
         import re as _re
-        _src = open(os.path.join(HERE, "..", "server.py"), encoding="utf-8").read()
+        # 1.4.1 起 VERSION 定义在 dlcore/config.py
+        _cfg = os.path.join(HERE, "..", "dlcore", "config.py")
+        _src = open(_cfg if os.path.isfile(_cfg) else os.path.join(HERE, "..", "server.py"),
+                    encoding="utf-8").read()
         _ver = _re.search(r'VERSION = "([0-9.]+)"', _src).group(1)
         _parts = (_ver.split(".") + ["0", "0", "0", "0"])[:4]
         _v4 = ",".join(str(int(x)) for x in _parts)

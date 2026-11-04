@@ -76,9 +76,49 @@ def parse_args(argv):
 
 def main():
     _set_app_user_model_id()
+    if "--selfcheck" in sys.argv[1:]:
+        print(server.health_line())
+        for item in server.describe():
+            print("  %-2s dlcore/%-9s %-8s %s" % (
+                "OK" if item["state"] == "ok" else "降级",
+                item["name"] + ".py", item["state"], item["error"] or "-"))
+        return 0 if not server.degraded_names() else 1
     port, pin, recv, use_gui, use_browser, secure = parse_args(sys.argv[1:])
     if secure:
-        server.SECURE_MODE = True
+        server.config.set_secure(True)
+
+    # 有模块没起来时先在控制台说清楚，再决定走完整模式还是降级模式（1.4.2）
+    server.print_degraded_report()
+
+    if not server.module_ok("httpd"):
+        # HTTP 传输模块坏了：托盘/GUI 都没有意义，起最小服务只提供诊断页。
+        try:
+            info = server.start_degraded(port)
+        except RuntimeError as exc:
+            print(str(exc))
+            return 1
+        print()
+        print("  %s v%s  ·  降级模式（HTTP 模块不可用）" % (server.APP_NAME, server.VERSION))
+        print("  电脑打开：  http://127.0.0.1:%d" % info["port"])
+        print("  此页面只显示模块状态，不能传文件。")
+        print()
+        if use_browser:
+            try:
+                server.open_app_window("http://127.0.0.1:%d" % info["port"])
+            except Exception:
+                pass
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        try:
+            info["httpd"].shutdown()
+            info["httpd"].server_close()
+        except Exception:
+            pass
+        return 0
+
     try:
         info = server.start_server(port, pin, recv, background=True)
     except RuntimeError as exc:

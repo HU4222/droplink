@@ -1,0 +1,92 @@
+[
+ {
+  "module": "基线",
+  "mode": "无故障",
+  "pass": true,
+  "detail": "ping 200 / 首页 200 / 无降级"
+ },
+ {
+  "module": "config",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "config",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "fsutil",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "fsutil",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "state",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "state",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "winenv",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "winenv",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "media",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "media",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "api",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "api",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 200 / 正常服务+标注 / 10 个接口无 500"
+ },
+ {
+  "module": "httpd",
+  "mode": "missing",
+  "pass": true,
+  "detail": "首页 200 / ping 503 / 降级服务 / 10 个接口无 500"
+ },
+ {
+  "module": "httpd",
+  "mode": "broken",
+  "pass": true,
+  "detail": "首页 200 / ping 503 / 降级服务 / 10 个接口无 500"
+ }
+]

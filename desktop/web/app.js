@@ -52,7 +52,7 @@
     networks: [],        // 本机所有网卡 IP（网络切换）
     selectedIp: localStorage.getItem('dl.ip') || '',
     peers: [],           // 已接入的终端
-    sendFiles: [],       // 电脑端已选的待发送文件
+    sendFiles: [],       // 本机已选的待发送文件
   };
 
   /* ---------------- 小工具 ---------------- */
@@ -115,6 +115,17 @@
 
   /* ---------------- 网络 ---------------- */
 
+  /** 把浏览器的原始网络异常翻译成用户能照着做的提示（U1）。 */
+  function friendlyNetError(e) {
+    const m = String((e && e.message) || e || '').toLowerCase();
+    if (m.includes('failed to fetch') || m.includes('networkerror') || m.includes('load failed')) {
+      return '连不上接收端：确认接收端上的 DropLink 还在运行，且两端在同一个 Wi-Fi';
+    }
+    if (m.includes('timeout') || m.includes('timed out')) return '连接超时：接收端可能进了休眠，或 Wi-Fi 信号弱';
+    if (m.includes('abort')) return '请求被中断，请重试';
+    return (e && e.message) || '网络异常';
+  }
+
   async function api(path, opts = {}) {
     const init = { credentials: 'same-origin', ...opts };
     init.headers = Object.assign({}, init.headers || {});
@@ -122,7 +133,12 @@
     if (init.body && typeof init.body === 'string') {
       init.headers['Content-Type'] = init.headers['Content-Type'] || 'application/json';
     }
-    const res = await fetch(path, init);
+    let res;
+    try {
+      res = await fetch(path, init);
+    } catch (e) {
+      throw new Error(friendlyNetError(e));
+    }
     let data = null;
     const ct = res.headers.get('content-type') || '';
     if (ct.includes('application/json')) {
@@ -158,7 +174,7 @@
   }
 
   // 安卓原生桥在，就交给它：确认弹窗、.part、改名、通知整条链路都由原生实现。
-  // 浏览器里（电脑本机界面）继续用 <a download>。
+  // 浏览器里（本机界面）继续用 <a download>。
   function nativeBridge() {
     const b = window.androidBridge;
     return b && typeof b.downloadFile === 'function' ? b : null;
@@ -182,6 +198,11 @@
     document.body.appendChild(a);
     a.click();
     setTimeout(() => a.remove(), 1000);
+    if (state.platform === 'ios' || state.platform === 'harmony') {
+      toast(state.platform === 'ios'
+        ? '已开始下载，文件在「文件」App'
+        : '已开始下载，见浏览器「下载管理」');
+    }
     return false;
   }
 
@@ -527,7 +548,75 @@
       return '安卓 ' + (m ? m[1] : '设备');
     }
     if (ua.includes('iPhone') || ua.includes('iPad')) return '苹果设备';
-    return '手机设备';
+    return '未知设备';
+  }
+
+  /* ---------------- 平台识别（1.4.4） ----------------
+     iOS / 鸿蒙走纯浏览器，没有原生桥。这里只影响文案与降级路径，
+     不阉割功能：能传就传，保存位置与后台行为交给系统决定。 */
+  function platformOf() {
+    const ua = navigator.userAgent || '';
+    if (/HarmonyOS|OpenHarmony|ArkWeb/i.test(ua)) return 'harmony';
+    if (/iPhone|iPad|iPod/i.test(ua)) return 'ios';
+    // iPadOS 13+ 默认桌面 UA，靠触摸点数区分
+    if (/Macintosh/i.test(ua) && (navigator.maxTouchPoints || 0) > 1) return 'ios';
+    if (/Android/i.test(ua)) return window.androidBridge ? 'android-app' : 'android-web';
+    return 'desktop';
+  }
+  state.platform = platformOf();
+
+  function platformLabel() {
+    const map = {
+      'ios': 'iPhone / iPad · Safari',
+      'harmony': '鸿蒙 · 浏览器',
+      'android-app': '安卓 App',
+      'android-web': '安卓 · 浏览器',
+      'desktop': '桌面浏览器',
+    };
+    return map[state.platform] || '浏览器';
+  }
+
+  /**
+   * 跨端提示浮层（1.4.5）：iOS / 鸿蒙首次访问时出现，5 秒后自动消失，也可手动关。
+   * 只出现一次（localStorage 记忆），不打断浏览——首屏不再被占用。
+   */
+  function showCompatTip() {
+    const box = $('#compatTip');
+    if (!box) return;
+    const pf = state.platform;
+    // 只有装了原生 App 才有完整能力；其余（iOS / 鸿蒙 / 安卓浏览器 / 桌面浏览器）都提示一次
+    if (pf === 'android-app') { box.hidden = true; return; }
+
+    const key = 'dl_compat_' + pf + '_v2';
+    try { if (localStorage.getItem(key) === '1') { box.hidden = true; return; } } catch (e) {}
+
+    const texts = {
+      'ios': '下载的文件会存到「文件」App → 下载项。iOS 不允许网页在后台续传，切走会暂停。',
+      'harmony': '下载交给浏览器，文件在「下载管理」里。网页无法后台续传，切走会暂停。',
+      'android-web': '下载交给浏览器，文件在「下载管理」里。切走或锁屏会暂停。',
+      'desktop': '下载的文件会存到系统的「下载」文件夹。浏览器不支持断点续传与后台传输。',
+    };
+    $('#compatTipText').textContent = texts[pf] || texts['desktop'];
+    box.hidden = false;
+
+    const hide = () => {
+      if (box.hidden) return;
+      box.hidden = true;
+      try { localStorage.setItem(key, '1'); } catch (e) {}
+    };
+
+    // 重启进度条动画（同一个页面里重复调用时不会卡在半截）
+    const bar = box.querySelector('.compat-tip-bar');
+    if (bar) {
+      bar.style.animation = 'none';
+      void bar.offsetWidth;
+      bar.style.animation = '';
+    }
+    const btn = $('#compatTipClose');
+    if (btn) btn.onclick = hide;
+
+    clearTimeout(showCompatTip._timer);
+    showCompatTip._timer = setTimeout(hide, 5000);
   }
 
   async function doLogin() {
@@ -579,7 +668,12 @@
       pollPeers();
       pollInbox();
       renderSendPanel();
-      // 电脑本机首次打开时显示引导；手机端不弹
+      renderDlQueue();
+      showCompatTip();
+      if (!window.__dlqTimer && dlBridge()) {
+        window.__dlqTimer = setInterval(renderDlQueue, 1500);
+      }
+      // 本机首次打开时显示引导；对端不弹
       if (s.local && !localStorage.getItem(ONBOARD_KEY)) showGuide();
     } catch (e) {
       if (e && e.needLogin) {
@@ -594,16 +688,16 @@
         return;
       }
       $('#deviceName').textContent = '未连接';
-      $('#deviceSub').textContent = e.message || '请确认电脑端已启动';
+      $('#deviceSub').textContent = e.message || '请确认接收端已启动';
       $('#netDot').classList.add('is-off');
     }
   }
 
   function renderDevice() {
     const s = state.session || {};
-    $('#deviceName').textContent = s.local ? `${s.device}（本机）` : `已连接 ${s.device || '电脑'}`;
+    $('#deviceName').textContent = s.local ? `${s.device}（本机）` : `已连接 ${s.device || '对端'}`;
     $('#deviceSub').textContent = s.local
-      ? '电脑端 · 手机可扫码连接'
+      ? '接收端 · 发送端可扫码连接'
       : '局域网直连 · 不消耗流量';
     $('#netDot').classList.remove('is-off');
     const foot = $('#navFoot');
@@ -613,6 +707,59 @@
   /* ---------------- 视图切换 ---------------- */
 
   const shownViews = new Set();
+  /** 下载队列（安卓端）：读原生队列快照，显示进度并支持暂停/继续/取消。 */
+  function dlBridge() {
+    return (window.androidBridge && typeof window.androidBridge.downloadQueue === 'function')
+      ? window.androidBridge : null;
+  }
+
+  function renderDlQueue() {
+    const box = $('#dlQueue');
+    if (!box) return;
+    const b = dlBridge();
+    if (!b) { box.classList.add('hidden'); return; }
+    let tasks = [];
+    try { tasks = JSON.parse(b.downloadQueue() || '[]'); } catch (e) { tasks = []; }
+    if (!tasks.length) { box.classList.add('hidden'); return; }
+    box.classList.remove('hidden');
+
+    const active = tasks.filter(t => t.state === 'queued' || t.state === 'running' || t.state === 'paused').length;
+    $('#dlqCount').textContent = active ? `${active} 个未完成` : '全部完成';
+    $('#dlqList').innerHTML = tasks.slice(-6).reverse().map(t => {
+      const pct = t.size > 0 ? Math.min(100, Math.round(t.done * 100 / t.size)) : 0;
+      const label = t.state === 'running' ? `${fmtSize(t.done)} / ${fmtSize(t.size)}`
+        : t.state === 'paused' ? '已暂停'
+        : t.state === 'failed' ? (t.err || '失败')
+        : t.state === 'done' ? '已完成' : '排队中';
+      const btn = t.state === 'running' ? `<button class="dlq-btn" data-dl="pause" data-id="${t.id}">暂停</button>`
+        : t.state === 'paused' || t.state === 'failed' ? `<button class="dlq-btn" data-dl="resume" data-id="${t.id}">继续</button>`
+        : '';
+      return `<div class="dlq-item">
+        <span class="dlq-name">${esc(t.name)}</span>
+        <span class="dlq-meta">${label}</span>
+        <span class="dlq-bar"><i style="width:${pct}%"></i></span>
+        ${btn}
+        <button class="dlq-btn" data-dl="cancel" data-id="${t.id}">删除</button>
+      </div>`;
+    }).join('');
+  }
+  window.onDownloadQueueChanged = renderDlQueue;
+
+  document.addEventListener('click', (ev) => {
+    const btn = ev.target.closest && ev.target.closest('[data-dl]');
+    if (!btn) return;
+    const b = dlBridge();
+    if (!b) return;
+    const id = btn.getAttribute('data-id');
+    const act = btn.getAttribute('data-dl');
+    try {
+      if (act === 'pause') b.pauseDownload(id);
+      else if (act === 'resume') b.resumeDownload(id);
+      else if (act === 'cancel') b.cancelDownload(id);
+    } catch (e) { toast(friendlyNetError(e)); }
+    setTimeout(renderDlQueue, 300);
+  });
+
   function switchView(view) {
     state.view = view;
     $$('.view').forEach((v) => {
@@ -723,14 +870,17 @@
       empty.classList.remove('hidden');
       empty.innerHTML = state.searching
         ? `${ico('search')}<b>没有找到匹配的文件</b><span>换个关键词试试</span>`
-        : `${ico('folderOpen')}<b>这里是空的</b><span>${state.writable ? '点「传文件」把手机里的内容放进来' : '换一个文件夹看看'}</span>`;
+        : `${ico('folderOpen')}<b>这里是空的</b><span>${state.writable ? '点「传文件」把发送端的内容放进来' : '换一个文件夹看看'}</span>`;
       $('#listFoot').textContent = '';
       return;
     }
     $('#emptyState').classList.add('hidden');
 
     const wide = state.mode === 'grid' ? 400 : 160;
-    box.innerHTML = list.map((e, i) => {
+    // 分批渲染：首屏只插 24 行，其余按帧追加。一次性 innerHTML 几千行会让主线程卡住，
+    // 冷启动时表现为「点了 App 先愣半秒」（复测 P3-02）。
+    const seq = (state.renderSeq = (state.renderSeq || 0) + 1);
+    const parts = list.map((e, i) => {
       const selected = state.sel.has(e.path);
       let thumb = ico(KIND_ICON[e.kind] || 'file');
       if (e.kind === 'image' && state.session && state.session.thumb_available) {
@@ -748,7 +898,18 @@
         </div>
         <div class="row-side">${e.dir ? ico('chevron') : ''}</div>
       </div>`;
-    }).join('');
+    });
+
+    const CHUNK = 24;
+    box.innerHTML = '';
+    let cut = 0;
+    const step = () => {
+      if (seq !== state.renderSeq) return;          // 期间又刷新过，放弃这一批
+      box.insertAdjacentHTML('beforeend', parts.slice(cut, cut + CHUNK).join(''));
+      cut += CHUNK;
+      if (cut < parts.length) requestAnimationFrame(step);
+    };
+    step();
 
     $('#listFoot').textContent = state.searching
       ? '最多显示 300 条结果'
@@ -811,7 +972,7 @@
         <div class="empty">
           ${ico('file')}
           <b>这种文件无法预览</b>
-          <span>可以下载到手机，或生成扫码分享链接。</span>
+          <span>可以下载到本机，或生成扫码分享链接。</span>
         </div>
       </div>
       <div class="sheet-actions">
@@ -863,7 +1024,7 @@
       <div class="sheet-actions">
         <button class="btn btn-primary" data-act="sheetDownload">${ico('down')}下载</button>
         <button class="btn" data-act="sheetShare" ${isEmpty ? 'disabled title="空文件无需分享"' : ''}>${ico('qr')}分享</button>
-        ${state.session && state.session.local ? `<button class="btn" data-act="sheetOpenLocal">${ico('folderOpen')}在电脑打开</button>` : ''}
+        ${state.session && state.session.local ? `<button class="btn" data-act="sheetOpenLocal">${ico('folderOpen')}在本机打开</button>` : ''}
         <button class="btn btn-plain" data-act="closeSheet">关闭</button>
       </div>
     `);
@@ -900,7 +1061,7 @@
             <button class="btn" data-act="closeSheet">关闭</button>
           </div>
           <p class="muted" style="font-size:12px;margin:12px 0 0">
-            手机连同一 Wi-Fi，扫码即可直接下载这个文件。链接 24 小时内有效。
+            对方连同一 Wi-Fi，扫码即可直接下载这个文件。链接 24 小时内有效。
           </p>
         </div>
       `);
@@ -1180,7 +1341,7 @@
           <div class="badge ${t.direction === 'up' ? 'up' : 'down'}">${ico(t.direction === 'up' ? 'up' : 'down')}</div>
           <div class="titem-body">
             <div class="titem-name">${esc(t.name)}</div>
-            <div class="titem-sub">${t.direction === 'up' ? '手机 → 电脑' : '电脑 → 手机'} · ${fmtSize(t.size)}${t.speed ? ' · ' + fmtSize(t.speed) + '/s' : ''}</div>
+            <div class="titem-sub">${t.direction === 'up' ? '发送端 → 接收端' : '接收端 → 发送端'} · ${fmtSize(t.size)}${t.speed ? ' · ' + fmtSize(t.speed) + '/s' : ''}</div>
           </div>
           <div class="titem-sub">${fmtTime(t.ts)}</div>
         </div>`).join('');
@@ -1226,10 +1387,11 @@
     } catch (e) { /* 回退 */ }
     const ta = document.createElement('textarea');
     ta.value = text;
-    ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
     document.body.appendChild(ta);
-    ta.focus();
+    ta.setAttribute('readonly', '');
     ta.select();
+    ta.setSelectionRange(0, ta.value.length);
     try {
       document.execCommand('copy');
       toast('已复制');
@@ -1323,16 +1485,16 @@
     }).catch(() => {}).then(() => setTimeout(pollLive, 900));
   }
 
-  /* ---------------- 电脑端：发送到手机 ---------------- */
+  /* ---------------- 本机 → 对端：发送文件 ---------------- */
 
   function renderSendPanel() {
     const local = !!(state.session && state.session.local);
     const panel = $('#sendPanel');
     const drop = $('#dropzone');
     if (panel) panel.hidden = !local;
-    if (drop) drop.hidden = local;  // 电脑端隐藏「上传到电脑」，显示「发送到手机」
+    if (drop) drop.hidden = local;  // 本机隐藏「上传到接收端」，显示「发送到对端」
     const hero = document.querySelector('#view-send .hero h1');
-    if (hero) hero.textContent = local ? '把文件发给手机' : '把文件丢过来';
+    if (hero) hero.textContent = local ? '把文件发给对端' : '把文件丢过来';
     if (local) renderSendDevices();
   }
 
@@ -1343,7 +1505,7 @@
     const peers = state.peers || [];
     if (!peers.length) {
       list.innerHTML = '';
-      if (hint) hint.textContent = '还没有手机连接，请先用手机扫码连接。';
+      if (hint) hint.textContent = '还没有对端连接，请先让对方扫码连接。';
       return;
     }
     if (hint) hint.textContent = `已连接 ${peers.length} 台设备，勾选要发送的目标。`;
@@ -1464,7 +1626,7 @@
     xhr.send(file);
   }
 
-  /* ---------------- 手机端：自动接收 ---------------- */
+  /* ---------------- 对端：自动接收 ---------------- */
 
   let knownInbox = new Set();
   function pollInbox() {
@@ -1474,7 +1636,7 @@
       for (const it of items) {
         if (knownInbox.has(it.id)) continue;
         knownInbox.add(it.id);
-        toast(`收到来自电脑的文件：${it.name}`);
+        toast(`收到来自发送端的文件：${it.name}`);
         // 自动下载
         const a = document.createElement('a');
         a.href = it.url;
@@ -1505,7 +1667,7 @@
 
     const html = [
       `<div class="card">
-        <h3>${android ? '让对方设备连接' : '手机连接方式'}</h3>
+        <h3>${android ? '让对端连接' : '对端连接方式'}</h3>
         <div class="qr-wrap">
           ${qrAvailable ? `<img src="/qr.png?text=${encodeURIComponent(qrText)}" alt="连接二维码">` : ''}
           <div class="qr-side">
@@ -1513,7 +1675,7 @@
             <p class="muted" style="font-size:12.5px;margin:10px 0 0">
               ${android
                 ? '让对方设备连同一个 Wi-Fi 或你的热点，扫二维码或打开上面的地址。'
-                : '电脑和手机连同一个 Wi-Fi，手机浏览器打开上面的地址即可。'}
+                : '发送端与接收端连同一个 Wi-Fi，发送端浏览器打开上面的地址即可。'}
               ${qrAvailable ? '也可以直接扫左边的二维码。' : ''}
             </p>
             <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
@@ -1525,14 +1687,14 @@
       </div>`,
     ];
 
-    // 多网络切换（有多个网卡/IP 时，选对对方能连的那个；电脑端和手机端都显示）
+    // 多网络切换（有多个网卡/IP 时，选对对方能连的那个；两侧界面都显示）
     if (s.local && state.networks.length > 1) {
       const opts = state.networks.map((n) =>
         `<option value="${esc(n.ip)}" ${n.ip === state.selectedIp ? 'selected' : ''}>${esc(n.ip)}（${esc(n.alias)}）</option>`).join('');
       html.push(`<div class="card">
         <h3>切换网络</h3>
         <p class="muted" style="font-size:12.5px;margin:0 0 10px">
-          ${android ? '有多个网络地址时，二维码会跟随这里选中的网络。对方连不上就换一个试试。' : '电脑有多个网卡时，二维码和地址会跟随这里选中的网络。手机连不上就换一个试试。'}
+          ${android ? '有多个网络地址时，二维码会跟随这里选中的网络。对方连不上就换一个试试。' : '接收端有多个网卡时，二维码和地址会跟随这里选中的网络。发送端连不上就换一个试试。'}
         </p>
         <div class="searchbar" style="padding:0">
           <select id="netSelect" style="width:100%;padding:12px;border:none;background:transparent;font-size:14px;color:var(--text)">
@@ -1548,18 +1710,18 @@
         <h3>配对码</h3>
         <div class="pin-big">${esc(s.pin)}</div>
         <p class="muted" style="font-size:12.5px;margin:8px 0 0">
-          手机第一次打开网页时需要输入它。只保存在本次运行中，重启电脑端后会更新。
+          发送端第一次打开网页时需要输入它。只保存在本次运行中，重启接收端后会更新。
         </p>
       </div>`);
     }
 
     html.push(`<div class="card">
       <h3>设备信息</h3>
-      <div class="kv"><span>电脑名称</span><b>${esc(s.device || '-')}</b></div>
+      <div class="kv"><span>接收端名称</span><b>${esc(s.device || '-')}</b></div>
       <div class="kv"><span>接收目录</span><b class="mono">${esc(s.recv_dir || '-')}</b></div>
       <div class="kv"><span>服务版本</span><b>${esc(s.app || '')} v${esc(s.version || '')}</b></div>
       <div class="kv"><span>已运行</span><b>${Math.floor((s.uptime || 0) / 60)} 分钟</b></div>
-      <div class="kv"><span>当前设备</span><b>${s.local ? '电脑本机' : '手机 / 其他设备'}</b></div>
+      <div class="kv"><span>当前设备</span><b>${s.local ? '本机（接收端）' : '发送端'}</b></div>
       ${s.local ? `<div class="kv"><span>已接入设备</span><b>${state.peers.length ? `${state.peers.length} 台` : '暂无'}</b></div>` : ''}
       <div class="kv"><span>使用提示</span><b>${tipsEnabled() ? '显示中' : '已关闭'}</b></div>
       <div class="sheet-actions" style="margin-top:10px">
@@ -1574,12 +1736,12 @@
         html.push(`<div class="card">
           <h3>浏览范围</h3>
           <div class="kv"><span>当前可以浏览</span>
-            <b style="color:${allFiles ? 'var(--ok)' : 'var(--muted)'}">${allFiles ? '手机全部文件' : '仅 DropLink 目录'}</b>
+            <b style="color:${allFiles ? 'var(--ok)' : 'var(--muted)'}">${allFiles ? '全部文件' : '仅 DropLink 目录'}</b>
           </div>
           <p class="muted" style="font-size:12.5px;margin:8px 0 0">
             ${allFiles
               ? '已获得「所有文件访问」权限，「浏览」页可以直接翻看下载、相册、文档等目录。'
-              : '想让对方在「浏览」页看到手机的下载、相册、文档？点下面的按钮，在系统设置里允许「所有文件访问」即可。'}
+              : '想让发送端在「浏览」页看到下载、相册、文档？点下面的按钮，在系统设置里允许「所有文件访问」即可。'}
           </p>
           ${allFiles ? '' : '<button class="btn btn-primary" style="margin-top:10px" data-act="openAllFiles">开启全部文件访问</button>'}
         </div>`);
@@ -1592,7 +1754,7 @@
         html.push(`<div class="card">
           <h3>接收设置</h3>
           <p class="muted" style="font-size:12.5px;margin:0 0 10px">
-            手机传来的文件会保存到这里。可以改成任意文件夹。
+            发送端传来的文件会保存到这里。可以改成任意文件夹。
           </p>
           <div class="searchbar" style="padding:0">
             <input id="recvInput" value="${esc(s.recv_dir || '')}" spellcheck="false">
@@ -1619,7 +1781,7 @@
         html.push(`<div class="card">
           <h3>防火墙</h3>
           <p class="muted" style="font-size:12.5px;margin:0 0 10px">
-            手机连不上电脑，多半是 Windows 防火墙拦了入站连接。点「设置防火墙规则」放行
+            发送端连不上接收端，多半是接收端的 Windows 防火墙拦了入站连接。点「设置防火墙规则」放行
             （会弹一次系统授权确认，点「是」即可）；不用了可以随时「删除规则」。
           </p>
           <div class="sheet-actions">
@@ -1633,11 +1795,11 @@
       }
     } else {
       html.push(`<div class="card">
-        <h3>在手机上使用</h3>
+        <h3>在发送端使用</h3>
         <ol class="steps">
           <li>点浏览器菜单里的「<b>添加到主屏幕</b>」，就能像 App 一样打开。</li>
-          <li>「浏览」里可以看电脑上的文件，点开即预览。</li>
-          <li>「传文件」把手机照片、视频、文档传到电脑。</li>
+          <li>「浏览」里可以看接收端上的文件，点开即预览。</li>
+          <li>「传文件」把本机的照片、视频、文档传过去。</li>
           <li>「剪贴板」可以在两端互发文字和链接。</li>
         </ol>
       </div>`);
@@ -1647,7 +1809,7 @@
       <h3>为什么不消耗流量</h3>
       <ol class="steps">
         <li>文件只在你家的局域网里传输，<b>不经过互联网、不上传云端</b>。</li>
-        <li>没有 Wi-Fi 时，可以让电脑开启「<b>移动热点</b>」，手机连上电脑的热点即可（同样不走流量）。</li>
+        <li>没有 Wi-Fi 时，可以让接收端开启「<b>移动热点</b>」，发送端连上接收端的热点即可（同样不走流量）。</li>
         <li>传输速度取决于路由器，一般 10–60 MB/s，比网盘快很多。</li>
       </ol>
     </div>`);
@@ -1656,11 +1818,23 @@
       html.push(`<div class="card">
         <h3>第一次用？</h3>
         <p class="muted" style="font-size:12.5px;margin:0 0 10px">
-          花 30 秒看一遍图文引导，手机马上就能连上来。
+          花 30 秒看一遍图文引导，发送端马上就能连上来。
         </p>
         <button class="btn" data-act="showGuide">查看使用引导</button>
       </div>`);
     }
+
+    // 当前客户端（1.4.4）：iOS / 鸿蒙 / 安卓浏览器都靠它自证身份，便于排查
+    html.push(`<div class="card">
+      <h3>当前设备</h3>
+      <div class="kv"><span>浏览器</span><b>${esc(platformLabel())}</b></div>
+      <div class="kv"><span>页面版本</span><b>${esc((s.version || '') + ' · ' + (state.platform === 'desktop' ? 'desktop' : 'mobile'))}</b></div>
+      <p class="muted" style="font-size:12px;margin:8px 0 0">
+        ${state.platform === 'ios' || state.platform === 'harmony'
+          ? '浏览器模式：下载由系统接管，不支持后台续传与通知栏操作；其余功能与安卓一致。'
+          : '完整模式：支持下载队列、断点续传与通知栏操作。'}
+      </p>
+    </div>`);
 
     // 署名（G-16）：只在「我的」页底部出现一次，不放进按钮/提示/引导文案
     html.push('<p class="author">由 HU4222 制作 · DropLink</p>');
@@ -1742,7 +1916,7 @@
         <div class="card">
           <h3>网络类型</h3>
           ${prof}
-          ${pub.length ? '<p class="muted" style="font-size:12px;margin:8px 0 0">检测到「公用」网络：若手机连的是这个网络，放行规则可能对不上号。建议在系统设置里把它改成「专用网络」。</p>' : ''}
+          ${pub.length ? '<p class="muted" style="font-size:12px;margin:8px 0 0">检测到「公用」网络：若发送端连的是这个网络，放行规则可能对不上号。建议在系统设置里把它改成「专用网络」。</p>' : ''}
         </div>`;
 
     const hotspotCard = android ? `
@@ -1757,7 +1931,7 @@
           <h3>宿舍 / 校园网大概率连不上？</h3>
           <p class="muted" style="font-size:12.5px;margin:0 0 10px">
             宿舍和校园网几乎都开了「<b>AP 隔离 / 客户端隔离</b>」——同一 Wi-Fi 下设备之间互相看不到，
-            防火墙和「专用网络」都解决不了它。最省事的办法是让<b>电脑开「移动热点」</b>，手机连电脑的热点，
+            防火墙和「专用网络」都解决不了它。最省事的办法是让<b>接收端开「移动热点」</b>，发送端连接收端的热点，
             直接绕开宿舍路由器。
           </p>
           <button class="btn btn-primary" data-act="openHotspot">打开移动热点设置</button>
@@ -1901,7 +2075,7 @@
       case 'sheetOpenLocal':
         if (state.sheetEntry) {
           api('/api/open', { method: 'POST', body: JSON.stringify({ path: state.sheetEntry.path }) })
-            .then(() => toast('已在电脑上打开')).catch((e) => toast(e.message, true));
+            .then(() => toast('已在本机打开')).catch((e) => toast(e.message, true));
         }
         break;
       case 'copyShared':
@@ -2115,7 +2289,7 @@
     const el = $('#clipInput');
     const text = el.value.trim();
     if (!clipTextOk(text)) { toast('请输入内容', true); return; }
-    const from = state.session && state.session.local ? '电脑' : '手机';
+    const from = state.session && state.session.local ? '接收端' : '发送端';
     api('/api/clip', { method: 'POST', body: JSON.stringify({ text, from }) })
       .then(() => {
         el.value = '';
@@ -2144,7 +2318,7 @@
     const free = freeBytes();
     if (!size || size < (1 << 30)) return true;
     let msg = `${action} ${fmtSize(size)} 的文件？`;
-    if (free) msg += `\n手机剩余空间 ${fmtSize(free)}`;
+    if (free) msg += `\n本机剩余空间 ${fmtSize(free)}`;
     if (free && size > free) msg += '\n\n剩余空间不足，可能写到一半失败。';
     return confirm(msg);
   }
@@ -2164,7 +2338,7 @@
     if (chosen.length > 100) { toast('一次最多打包 100 项，请分批操作', true); return; }
     const total = chosen.reduce((s, x) => s + (x.size || 0), 0);
     let msg = `打包 ${chosen.length} 个文件，共 ${fmtSize(total)}？`;
-    if (free) msg += `\n手机剩余空间 ${fmtSize(free)}`;
+    if (free) msg += `\n本机剩余空间 ${fmtSize(free)}`;
     if (free && total > free) msg += '\n\n剩余空间可能不足。';
     if (!confirm(msg)) return;
 
@@ -2178,7 +2352,7 @@
   async function deleteSelected() {
     const items = Array.from(state.sel.values());
     if (!items.length) return;
-    if (!confirm(`删除 ${items.length} 项到回收站？\n（可在电脑回收站里还原）`)) return;
+    if (!confirm(`删除 ${items.length} 项到回收站？\n（可在接收端回收站里还原）`)) return;
     try {
       await api('/api/delete', { method: 'POST', body: JSON.stringify({ paths: items.map((x) => x.path) }) });
       toast('已移入回收站');
@@ -2249,7 +2423,7 @@
     });
   });
 
-  // 电脑端「发送到手机」的文件选择
+  // 本机「发送到对端」的文件选择
   document.getElementById('sendFileInput').addEventListener('change', (ev) => {
     const files = Array.from(ev.target.files || []);
     if (files.length) {
