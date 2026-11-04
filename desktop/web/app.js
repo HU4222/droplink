@@ -1662,6 +1662,9 @@
       </div>`);
     }
 
+    // 署名（G-16）：只在「我的」页底部出现一次，不放进按钮/提示/引导文案
+    html.push('<p class="author">由 HU4222 制作 · DropLink</p>');
+
     $('#aboutBody').innerHTML = html.join('');
   }
 

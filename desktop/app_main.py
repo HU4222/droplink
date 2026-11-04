@@ -65,6 +65,10 @@ def parse_args(argv):
             browser = False; i += 1
         elif a == "--secure":
             secure = True; i += 1
+        elif a in ("--version", "-V"):
+            # 版本输出里带署名（G-16）：命令行 / 关于弹窗是必放的签名位之一
+            print("%s %s · HU4222" % (server.APP_NAME, server.VERSION))
+            raise SystemExit(0)
         else:
             i += 1
     return port, pin, recv, gui, browser, secure

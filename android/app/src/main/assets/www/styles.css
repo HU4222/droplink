@@ -1094,3 +1094,14 @@ body.tips-off .inline-tip { display: none; }
 
 /* 长列表：只渲染视口附近的行，1 万项时滚动不卡（报告 C 节） */
 .row { content-visibility: auto; contain-intrinsic-size: auto 74px; }
+
+/* 作者署名：页脚一行，弱化显示，不参与交互 */
+.author {
+  margin: 18px 0 4px;
+  text-align: center;
+  font-size: 11.5px;
+  letter-spacing: .3px;
+  color: var(--muted);
+  opacity: .75;
+  user-select: text;
+}

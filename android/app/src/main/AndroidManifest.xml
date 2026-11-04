@@ -39,6 +39,11 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.DropLink">
 
+        <!-- 作者署名（G-16）：产物元数据，不参与业务逻辑 -->
+        <meta-data
+            android:name="com.droplink.app.AUTHOR"
+            android:value="HU4222" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"

@@ -323,8 +323,41 @@ def main():
     if ico and windres:
         rc = os.path.join(stage, "icon.rc")
         ico_abs = os.path.abspath(ico).replace("\\", "/")
+        # 版本资源：CompanyName 是 G-16 要求的署名为之一（资源管理器属性里可见）
+        import re as _re
+        _src = open(os.path.join(HERE, "..", "server.py"), encoding="utf-8").read()
+        _ver = _re.search(r'VERSION = "([0-9.]+)"', _src).group(1)
+        _parts = (_ver.split(".") + ["0", "0", "0", "0"])[:4]
+        _v4 = ",".join(str(int(x)) for x in _parts)
         with open(rc, "w", encoding="utf-8") as f:
             f.write('1 ICON "%s"\n' % ico_abs)
+            f.write(
+                '1 VERSIONINFO\n'
+                'FILEVERSION %s\n'
+                'PRODUCTVERSION %s\n'
+                'FILEOS 0x4L\n'
+                'FILETYPE 0x1L\n'
+                'BEGIN\n'
+                '  BLOCK "StringFileInfo"\n'
+                '  BEGIN\n'
+                '    BLOCK "040904B0"\n'
+                '    BEGIN\n'
+                '      VALUE "CompanyName", "HU4222"\n'
+                '      VALUE "FileDescription", "DropLink - LAN file transfer"\n'
+                '      VALUE "FileVersion", "%s"\n'
+                '      VALUE "InternalName", "DropLink"\n'
+                '      VALUE "LegalCopyright", "(c) 2026 HU4222"\n'
+                '      VALUE "OriginalFilename", "DropLink.exe"\n'
+                '      VALUE "ProductName", "DropLink"\n'
+                '      VALUE "ProductVersion", "%s"\n'
+                '    END\n'
+                '  END\n'
+                '  BLOCK "VarFileInfo"\n'
+                '  BEGIN\n'
+                '    VALUE "Translation", 0x409, 1200\n'
+                '  END\n'
+                'END\n' % (_v4, _v4, _ver, _ver)
+            )
         obj = os.path.join(stage, "icon_res.o")
         # 在 stage 目录里跑，rc 用绝对路径，双重保证能找到图标文件
         r = subprocess.run([windres, "icon.rc", "-O", "coff", "-o", "icon_res.o"],

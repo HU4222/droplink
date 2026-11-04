@@ -42,7 +42,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP_NAME = "DropLink 互传"
 APP_SHORT = "DropLink"
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 # 个人使用模式（默认）：恢复安全加固前的宽松行为——
 # 本机请求免配对、可浏览任意目录、6 位配对码、上传不写 MOTW。
@@ -2634,6 +2634,9 @@ def main():
     ap.add_argument("--pin", default="", help="固定配对码（默认每次随机）")
     ap.add_argument("--recv", default="", help="指定接收目录")
     ap.add_argument("--no-browser", action="store_true", help="启动时不自动打开浏览器")
+    ap.add_argument("--version", "-V", action="version",
+                    version="%s %s · HU4222" % (APP_NAME, VERSION),
+                    help="输出版本号与作者后退出")
     ap.add_argument("--secure", action="store_true",
                     help="启用安全加固（Host/Origin 校验、本机令牌、敏感目录限制、8 位配对码）")
     args = ap.parse_args()

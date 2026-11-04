@@ -2,6 +2,14 @@
 
 All notable changes to DropLink. Download links point at the latest release.
 
+## v1.3.1 — 2026-11-04
+
+**Signature**
+
+- Every build now carries the author mark `HU4222`: once in the app ("Mine" page footer), once in `--version`, and once in the executable metadata (`CompanyName` for the EXE, `app_author` for the APK). No behaviour changes.
+
+> **中文**：1.3.1 只做一件事——按统一规范补作者署名 HU4222，共三处：应用内「我的」页底部、`--version` 输出、产物元数据（EXE 的 CompanyName、APK 的 app_author）。功能零改动。
+
 ## v1.3.0 — 2026-11-03
 
 **Fixes**
