@@ -277,6 +277,13 @@ for x in os.listdir(RECV):
                 os.remove(p)
         except OSError:
             pass
+# junction 的目标目录建在 RECV 外面，也要收掉，不能留在仓库根目录
+try:
+    import shutil as _sh
+    if os.path.isdir(target):
+        _sh.rmtree(target, ignore_errors=True)
+except Exception:
+    pass
 
 print("\n================ 结论 ================")
 print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))

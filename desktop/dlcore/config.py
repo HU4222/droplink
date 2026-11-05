@@ -33,12 +33,33 @@ import zlib
 
 APP_NAME = "DropLink 互传"
 APP_SHORT = "DropLink"
-VERSION = "1.4.7"
+VERSION = "1.5.0"
+
+# --------------------------------------------------------------------------
+# 版本身份（1.5.0 起）
+# --------------------------------------------------------------------------
+# personal = 个人版，secure = 安全版。两者是**同一份代码的两个构建产物**，
+# 不是两条 git 分支；安全版多出来的代码只在 dlcore/sec/ 下（个人版不打包）。
+#
+# 来源优先级（从高到低）：
+#   1. 构建期烤入：build/build_exe.py 会在 payload 里生成 dlcore/_edition_baked.py
+#   2. 环境变量 DROPLINK_EDITION
+#   3. 默认 personal
+# 源码运行时没有 _edition_baked.py，属于正常情况，走环境变量或默认值。
+try:
+    from ._edition_baked import EDITION as _BAKED_EDITION
+except Exception:
+    _BAKED_EDITION = ""
+
+EDITION = (_BAKED_EDITION or os.environ.get("DROPLINK_EDITION") or "personal").strip().lower()
+if EDITION not in ("personal", "secure"):
+    EDITION = "personal"
 
 # 个人使用模式（默认）：恢复安全加固前的宽松行为——
 # 本机请求免配对、可浏览任意目录、6 位配对码、上传不写 MOTW。
 # 需要重新打开加固：启动时加 --secure，或设置环境变量 DROPLINK_SECURE=1。
-SECURE_MODE = os.environ.get("DROPLINK_SECURE") == "1"
+# 安全版产物（EDITION=secure）默认全开，对应方案 §三「--secure 在安全版里无效果」。
+SECURE_MODE = os.environ.get("DROPLINK_SECURE") == "1" or EDITION == "secure"
 
 # Windows 下隐藏 netsh/powershell 子进程的控制台窗口，避免启动/诊断时闪黑窗
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -103,3 +124,12 @@ def set_secure(on: bool) -> None:
 def is_secure() -> bool:
     """其它模块一律通过它读开关：直接 import 常量会拿到导入时的快照。"""
     return SECURE_MODE
+
+
+def is_secure_edition() -> bool:
+    """当前产物是不是安全版。
+
+    与 is_secure() 是两件事：is_secure() 是运行期的加固开关（--secure 参数），
+    is_secure_edition() 是构建期定死的版本身份，运行期不可改。
+    """
+    return EDITION == "secure"

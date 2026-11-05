@@ -29,7 +29,8 @@ import zlib
 from .config import *
 from .fsutil import *  # 路径与常量
 
-def lan_urls(port: int):
+def lan_urls(port: int, scheme: str = "http"):
+    """本机局域网访问地址；scheme 由调用方按版本给（安全版 https）。"""
     ips = []
     # 1) UDP connect 不发送任何数据包，可拿到默认出口网卡地址
     try:
@@ -60,7 +61,8 @@ def lan_urls(port: int):
 
     ips = [ip for ip in ips if not ip.startswith("169.254.")]
     ips.sort(key=score)
-    return [f"http://{ip}:{port}" for ip in ips]
+    prefix = (scheme or "http").rstrip(":/") + "://"
+    return [f"{prefix}{ip}:{port}" for ip in ips]
 
 
 _HOST_CACHE = {"ts": 0.0, "hosts": set()}

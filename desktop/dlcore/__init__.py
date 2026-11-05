@@ -37,7 +37,7 @@ MODULES = ("config", "fsutil", "state", "winenv", "media", "api", "httpd")
 STATUS = {}
 
 # 配置模块坏掉时用的兜底版本号；正式版本在 dlcore/config.py，两处需一致
-_FALLBACK_VERSION = "1.4.7"
+_FALLBACK_VERSION = "1.5.0"
 
 
 class Placeholder:
@@ -92,6 +92,15 @@ def _cfg_set_secure(on: bool) -> None:
 
 def _cfg_is_secure() -> bool:
     return bool(globals().get("SECURE_MODE"))
+
+
+def _cfg_is_secure_edition() -> bool:
+    """配置模块坏掉时版本身份不可知：按个人版处理。
+
+    个人版不注册任何安全版路由，降级状态下最坏结果是「安全版少三个接口」，
+    而不是把预留路由暴露出去。
+    """
+    return False
 
 
 def _fs_check_path(path: str):
@@ -251,6 +260,8 @@ FALLBACKS = {
         "_STATIC_CACHE": {},
         "set_secure": _cfg_set_secure,
         "is_secure": _cfg_is_secure,
+        "EDITION": "personal",
+        "is_secure_edition": _cfg_is_secure_edition,
     },
     "fsutil": {
         "LOCAL_TOKEN": os.environ.get("DROPLINK_LOCAL_TOKEN") or secrets.token_urlsafe(24),

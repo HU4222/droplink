@@ -1142,6 +1142,9 @@ body.tips-off .inline-tip { display: none; }
   transform-origin: left center; animation: compatBar 5s linear forwards; }
 @keyframes compatIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
 @keyframes compatBar { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+/* 安全版首次运行提示（S-14）：一次性说明条，不自动消失，不做成开关 */
+.secure-notice { border-color: color-mix(in srgb, var(--brand) 45%, var(--line)); }
+.secure-notice .compat-tip-txt { font-weight: 500; }
 @media (min-width: 980px) {
   .compat-tip { left: auto; right: 24px; bottom: 24px; width: 360px; }
 }

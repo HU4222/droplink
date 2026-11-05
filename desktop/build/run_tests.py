@@ -37,11 +37,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.dirname(HERE)
 
 SUITES = {
-    "e2e":        ("e2e_exe.py",        False),
-    "folder":     ("folder_check.py",   False),
-    "bulk":       ("bulk_check.py",     False),
-    "security":   ("security_check.py", True),
-    "hardening":  ("hardening_check.py", True),
+    # 名称: (脚本, 需要 --secure, 版本)
+    # 版本 "secure" = 安全版产物（TLS）；"" = 个人版（默认）
+    "e2e":        ("e2e_exe.py",        False, ""),
+    "folder":     ("folder_check.py",   False, ""),
+    "bulk":       ("bulk_check.py",     False, ""),
+    "security":   ("security_check.py", True,  ""),
+    "hardening":  ("hardening_check.py", True, ""),
+    "status":     ("status_check.py",   True,  "secure"),
+    "pathguard":  ("pathguard_check.py", True, "secure"),
+    "ratelimit":  ("ratelimit_check.py", True, "secure"),
+    "p1":         ("p1_check.py",        True,  "secure"),
+    "websec":     ("websec_check.py",    True,  "secure"),
 }
 
 
@@ -53,16 +60,23 @@ def free_port() -> int:
     return p
 
 
-def wait_ping(port, seconds=25) -> bool:
+def wait_ping(port, seconds=25, tls=False) -> bool:
     """探活：能连通即算起来了。
 
-    --secure 实例的 /api/ping 也要鉴权，返回 401 说明服务已经在跑——
-    把 401/403 当失败会让加固套件永远「服务未就绪」。
+    --secure 实例的 /api/ping 也要鉴权，返回 401 说明服务已经在跑；
+    安全版实例走 https（自签，不校验证书）。
     """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    if tls:
+        import ssl
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+    url = ("https" if tls else "http") + "://127.0.0.1:%d/api/ping" % port
     end = time.time() + seconds
     while time.time() < end:
         try:
-            with urllib.request.urlopen("http://127.0.0.1:%d/api/ping" % port, timeout=2) as r:
+            with opener.open(url, timeout=2) as r:
                 if r.status in (200, 401, 403):
                     return True
         except urllib.error.HTTPError as e:
@@ -74,13 +88,17 @@ def wait_ping(port, seconds=25) -> bool:
     return False
 
 
-def start_server(port, pin, recv, secure, log_path):
+def start_server(port, pin, recv, secure, log_path, edition="", extra_env=None):
     cmd = [sys.executable, "-u", os.path.join(APP, "server.py"),
            "--port", str(port), "--pin", pin, "--no-browser", "--recv", recv]
     if secure:
         cmd.append("--secure")
     log = open(log_path, "wb")
     env = dict(os.environ, DROPLINK_LOCAL_TOKEN="runtests")
+    env.pop("DROPLINK_EDITION", None)
+    if edition:
+        env["DROPLINK_EDITION"] = edition
+    env.update(extra_env or {})
     p = subprocess.Popen(cmd, cwd=APP, stdout=log, stderr=subprocess.STDOUT, env=env)
     return p, log
 
@@ -127,7 +145,9 @@ def main():
     results = []
 
     for name in picked:
-        script, need_secure = SUITES[name]
+        entry = SUITES[name]
+        script, need_secure = entry[0], entry[1]
+        edition = entry[2] if len(entry) > 2 else ""
         path = os.path.join(HERE, script)
         if not os.path.isfile(path):
             results.append((name, "SKIP", "脚本不存在"))
@@ -141,18 +161,27 @@ def main():
         # 后面的 Range 用例就会假失败）。隔离后每个结果都能独立复现。
         port = args.port or free_port()      # 每套独立实例，直接取空闲端口，不做 +1（+1 可能被占用）
         pin = (args.pin + "78")[:8] if need_secure and len(args.pin) < 8 else args.pin
-        log_path = os.path.join(outdir, "server_%s_%s.log" % (name, "secure" if need_secure else "plain"))
-        proc, logf = start_server(port, pin, recv, need_secure, log_path)
+        suffix = "secure" if edition == "secure" else ("hardened" if need_secure else "plain")
+        log_path = os.path.join(outdir, "server_%s_%s.log" % (name, suffix))
+        extra_env = {}
+        if edition == "secure":
+            extra_env["DROPLINK_CERT_DIR"] = os.path.join(outdir, "certs")
+            extra_env["DROPLINK_TRUST_FILE"] = os.path.join(outdir, "trust_%s.json" % name)
+        if name == "status":
+            extra_env["DROPLINK_TRANSFER_TTL"] = "2"
+        proc, logf = start_server(port, pin, recv, need_secure, log_path, edition, extra_env)
         try:
-            if not wait_ping(port):
+            if not wait_ping(port, tls=(edition == "secure")):
                 results.append((name, "FAIL", "服务未就绪（见 %s）" % os.path.basename(log_path)))
                 continue
             # 令牌必须与服务端一致：套件里默认是 testtoken123，不一致会让部分用例 401，
             # 进而触发错误计数与锁定，后面的用例就连锁失败。
             env = dict(os.environ, DROPLINK_PIN=pin, DROPLINK_RECV=recv,
                        DROPLINK_LOCAL_TOKEN="runtests")
-            print("→ %-10s 跑 %s（端口 %d%s）..." % (
-                name, script, port, "，--secure" if need_secure else ""), flush=True)
+            env.pop("DROPLINK_EDITION", None)
+            env.update(extra_env)
+            tag = "，secure edition" if edition == "secure" else ("，--secure" if need_secure else "")
+            print("→ %-10s 跑 %s（端口 %d%s）..." % (name, script, port, tag), flush=True)
             t0 = time.time()
             p = subprocess.run([sys.executable, "-u", path, str(port)], cwd=APP,
                                capture_output=True, text=True, encoding="utf-8",

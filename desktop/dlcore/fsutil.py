@@ -25,6 +25,9 @@ import unicodedata
 import urllib.parse
 import webbrowser
 import zipfile
+
+# 本程序生成的临时上传文件：.dl_ + 8 位小写 hex + .part（严格对齐 token_hex(4)）
+_PART_RE = re.compile(r"\.dl_[0-9a-f]{8}\.part")
 import zlib
 from .config import *
 from .config import is_secure
@@ -84,6 +87,40 @@ def _sensitive_roots():
     add(os.path.join(os.environ.get("ProgramData", ""), "Microsoft", "Windows", "Start Menu"))
     _SENSITIVE_ROOTS = roots
     return roots
+
+
+def sweep_parts(folder: str, older_than: float = 86400) -> tuple:
+    """清理接收目录里超过 older_than 秒的临时上传文件（S-11）。
+
+    只清理**本程序自己生成的**文件名：`.dl_<8 位小写 hex>.part`
+    （即 api.py 里 f".dl_{secrets.token_hex(4)}.part" 的形状）。
+    用户自己的 `.dl_userbackup.part`、`.dl_A1B2C3D4.part`、`report.part`
+    即使很旧也不会被删。
+
+    超过 24 小时的文件不可能还在写；不做文件锁，mtime 足够判断。
+    返回 (删除个数, 释放字节数)。
+    """
+    n = 0
+    freed = 0
+    now = time.time()
+    try:
+        for root, _dirs, files in os.walk(folder):
+            for fn in files:
+                if not _PART_RE.fullmatch(fn):
+                    continue
+                p = os.path.join(root, fn)
+                try:
+                    st = os.stat(p)
+                    if now - st.st_mtime < older_than:
+                        continue
+                    os.unlink(p)
+                    n += 1
+                    freed += st.st_size
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return n, freed
 
 
 def looks_unc(p: str) -> bool:

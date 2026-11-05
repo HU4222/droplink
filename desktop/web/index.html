@@ -26,6 +26,12 @@
   <i class="compat-tip-bar" aria-hidden="true"></i>
 </div>
 
+<!-- 安全版首次运行提示：一次性，只说明「已启用哪些安全能力」，不是开关（S-14） -->
+<div class="compat-tip secure-notice" id="secureNotice" role="status" hidden>
+  <div class="compat-tip-txt" id="secureNoticeText">本机已启用：TLS 加密 · 传输前确认 · 设备审批</div>
+  <button class="compat-tip-x" id="secureNoticeClose" type="button">知道了</button>
+</div>
+
 <div class="app">
   <!-- 侧栏 / 底部导航 -->
   <nav class="nav">
@@ -282,10 +288,15 @@
       <img src="/api/icon?size=96" alt="DropLink" width="96" height="96">
     </div>
     <h1>连接到接收端</h1>
-    <p class="muted">输入接收端屏幕上显示的 6 位配对码</p>
+    <p class="muted">输入接收端屏幕上显示的配对码</p>
     <input id="pinInput" class="pin-input" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="one-time-code" placeholder="······">
     <div class="login-error" id="loginError"></div>
     <button class="btn btn-primary btn-block" data-act="login">连接</button>
+    <div class="login-pending" id="loginPending" hidden>
+      <p class="muted" id="pendingText" style="margin:0 0 6px">已提交，等待电脑端批准…</p>
+      <p class="muted" id="pendingHint" style="font-size:12.5px;margin:0 0 12px"></p>
+      <button class="btn btn-plain btn-block" data-act="cancelPending">取消</button>
+    </div>
     <p class="login-foot">在 Windows 接收端运行「启动.bat」后，窗口里会显示配对码。<br>仅同一局域网内可用，不消耗流量。</p>
   </div>
 </div>
@@ -317,7 +328,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8.5a14 14 0 0 1 19 0"/><path d="M5.5 12a9.5 9.5 0 0 1 13 0"/><path d="M8.5 15.5a5 5 0 0 1 7 0"/><circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"/></svg>
         </div>
         <h2>先把发送端连上来</h2>
-        <p>让发送端连上和接收端<b>同一个 Wi-Fi</b>，扫「我的」页里的二维码；或让发送端浏览器打开那个地址，输入 <b>6 位配对码</b>。</p>
+        <p>让发送端连上和接收端<b>同一个 Wi-Fi</b>，扫「我的」页里的二维码；或让发送端浏览器打开那个地址，输入配对码。</p>
       </div>
       <div class="guide-slide" data-gstep="2">
         <div class="guide-ico">
@@ -342,6 +353,6 @@
 <input type="file" id="cameraInput" accept="image/*" capture="environment" hidden>
 <input type="file" id="folderInput" webkitdirectory directory multiple hidden>
 
-<script src="/static/app.js?v=16"></script>
+<script src="/static/app.js?v=17"></script>
 </body>
 </html>

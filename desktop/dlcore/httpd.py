@@ -27,13 +27,43 @@ import zipfile
 import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .config import *
-from .config import is_secure
+from .config import EDITION, is_secure, is_secure_edition
+from .logsafe import log, redact_ip, redact_path, safe_exc, stamp
 from .fsutil import *
+from .fsutil import SESSION_ABS_TTL
 from .media import *
 from .winenv import *
 from .state import STATE
 from .api import ApiMixin
 from .config import _LIVE, _LIVE_LOCK, _STATIC_CACHE  # 共享缓存（原地修改）
+
+# --------------------------------------------------------------------------
+# 按版注册的路由（1.5.0 分版骨架）
+# --------------------------------------------------------------------------
+# 安全版预留的三个接口；本轮（骨架期）只回 501，第二轮实装。
+# 关键点：个人版里这些路径压根不进分发，会落到各自末尾的 404，
+# 而不是 403/501 —— 不对外暴露「这里本来有个接口」。
+# 安全版预留的三个接口；本轮（骨架期）只回 501，第二轮实装。
+# 关键点：个人版里这些路径压根不进分发，会落到各自末尾的 404，
+# 而不是 403/501 —— 不对外暴露「这里本来有个接口」。
+SECURE_EDITION_ROUTES = frozenset((
+    "/api/device",
+    "/api/trust", "/api/trust/pending", "/api/trust/approve",
+    "/api/trust/reject", "/api/trust/revoke", "/api/trust/auto-accept",
+    "/api/login/status",
+    "/api/prepare-upload", "/api/upload/status",
+    "/api/approve", "/api/approve/pending", "/api/approve/cancel",
+))
+
+EDITION_ROUTES = {
+    "personal": frozenset(),
+    "secure": SECURE_EDITION_ROUTES,
+}
+
+# 所有版本出现过的专属路径（与「当前版本是否启用」无关），
+# 供 PUT/DELETE/OPTIONS 这类没有业务的方法判断该回 404 还是 501。
+ALL_EDITION_ROUTES = frozenset().union(*EDITION_ROUTES.values())
+
 
 def _static_asset(path, st, compressible):
     key = (path, st.st_mtime_ns, st.st_size)
@@ -67,6 +97,17 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 64
 
+    def __init__(self, server_address, RequestHandlerClass, context=None, scheme=None):
+        super().__init__(server_address, RequestHandlerClass)
+        # 安全版：监听 socket 包成 TLS（http.server 的标准做法）。
+        # 必须在 bind/listen 之后包，wrap 的是同一个 fd，accept 时做握手。
+        self.tls_context = context
+        # 对外的协议：个人版 http、安全版 https。路由/接口拼地址一律读它，
+        # 不要在业务代码里再写死 "http://"（P1-1）。
+        self.scheme = scheme or ("https" if context is not None else "http")
+        if context is not None:
+            self.socket = context.wrap_socket(self.socket, server_side=True)
+
     def handle_error(self, request, client_address):
         """客户端断连属于预期事件，别让它变成整段 Traceback（复测 P2-01）。
 
@@ -76,13 +117,43 @@ class Server(ThreadingHTTPServer):
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
             try:
-                sys.stderr.write("[断连] %s:%s %s\n" % (client_address[0], client_address[1],
-                                                         type(exc).__name__))
+                sys.stderr.write(stamp() + " [断连] %s %s\n" % (redact_ip(client_address[0]),
+                                                     type(exc).__name__))
+                sys.stderr.flush()
+            except Exception:
+                pass
+            return
+        # TLS 握手/解密失败（明文打 TLS 端口、证书告警中途取消）同样只记一行。
+        # 个人版包里没有 _ssl，所以按需导入：导不进来就说明不是 TLS 环境。
+        try:
+            import ssl as _ssl
+            is_tls = isinstance(exc, _ssl.SSLError)
+        except Exception:
+            is_tls = False
+        if is_tls:
+            try:
+                sys.stderr.write(stamp() + " [TLS] %s %s\n" % (redact_ip(client_address[0]),
+                                                     type(exc).__name__))
                 sys.stderr.flush()
             except Exception:
                 pass
             return
         super().handle_error(request, client_address)
+
+
+_CN_WARN_LOCK = threading.Lock()
+_CN_WARNED = set()
+
+# 个人版也要过 Origin 校验的「会改文件系统」的 POST（S-13）
+_MUTATING_POSTS = {
+    "/api/upload", "/api/delete", "/api/mkdir", "/api/rename",
+    "/api/clip", "/api/clip/delete",
+}
+
+# 会被浏览器当成脚本/标记执行、必须强制下载的扩展名（仅安全版，S-12）
+_ACTIVE_CONTENT_EXT = frozenset((
+    "html", "htm", "xhtml", "svg", "svgz", "mht", "mhtml", "xml", "xsl",
+))
 
 
 class Handler(ApiMixin, BaseHTTPRequestHandler):
@@ -129,14 +200,29 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
         return (h.rsplit(":", 1)[0] if ":" in h else h).lower()
 
     def _host_ok(self):
-        if not is_secure():
-            return True
+        # 两版都做 DNS 重绑定防护（S-13）：Host 必须是本机名/回环/本机网卡 IP。
         h = self._host_header()
-        return bool(h) and h in allowed_hosts(self.server.server_port)
+        ok = bool(h) and h in allowed_hosts(self.server.server_port)
+        if ok and is_secure_edition():
+            self._warn_cn_mismatch(h)
+        return ok
+
+    def _warn_cn_mismatch(self, host_header: str):
+        """Host 与证书 SAN 不一致时记一行（不拒绝：局域网 IP 访问本来就常见）。"""
+        sans = getattr(STATE, "cert_sans", None)
+        if not sans:
+            return
+        host = host_header.rsplit(":", 1)[0] if ":" in host_header else host_header
+        key = host.lower()
+        if key in sans or key in ("127.0.0.1", "localhost", "::1"):
+            return
+        with _CN_WARN_LOCK:
+            if key in _CN_WARNED:
+                return
+            _CN_WARNED.add(key)
+        log("[TLS] Host %s 不在证书 SAN 内（不影响访问）" % redact_ip(host))
 
     def _origin_ok(self):
-        if not is_secure():
-            return True
         o = (self.headers.get("Origin") or "").strip()
         if not o:
             return True
@@ -193,8 +279,9 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
+        # 两版都禁止被 iframe（S-13）；CSP / Permissions-Policy 仍只给安全版
+        self.send_header("X-Frame-Options", "DENY")
         if is_secure():
-            self.send_header("X-Frame-Options", "DENY")
             self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
             # 禁止被 iframe、禁止内联脚本执行（修复 DL-08 点击劫持与同源内联脚本）
             self.send_header(
@@ -207,6 +294,25 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
         self.end_headers()
         if getattr(self, "command", None) != "HEAD" and body:
             self.wfile.write(body)
+        if getattr(self, "close_connection", False):
+            # 错误回包后要关连接：先把客户端可能还在发的请求体读掉再关。
+            # 否则 Windows 会在关闭带未读数据的 socket 时发 RST，客户端偶发
+            # ConnectionAbortedError（加固套件的「连续 4 个坏名字」曾因此抖动）。
+            #
+            # 但必须封顶：慢速大包（每 0.1s 喂 8KB）会让 settimeout 永远不触发，
+            # 一个连接就能长期占住一个线程。宁可对异常客户端发 RST，也不排空无底洞。
+            #   上限 1 MB / 1 秒；排不完直接关（正常客户端错误回包时 body 都在 1MB 内）。
+            try:
+                self.connection.settimeout(0.2)
+                deadline = time.time() + 1.0
+                drained = 0
+                while drained < 1024 * 1024 and time.time() < deadline:
+                    chunk = self.rfile.read(min(8192, 1024 * 1024 - drained))
+                    if not chunk:
+                        break
+                    drained += len(chunk)
+            except Exception:
+                pass
 
     def _server_error(self, exc):
         """500 只回一个错误号，异常文本写日志（修复 X-08 信息回显）。
@@ -216,7 +322,7 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
         """
         if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
             try:
-                print(f"[断连] {self.client_address[0]}:{self.client_address[1]} {type(exc).__name__}")
+                log(f"[断连] {redact_ip(self.client_address[0])} {type(exc).__name__}")
             except Exception:
                 pass
             return
@@ -229,7 +335,7 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
                 return None
         eid = secrets.token_hex(4)
         try:
-            print(f"[错误 {eid}] {type(exc).__name__}: {exc}")
+            log(f"[错误 {eid}] {safe_exc(exc)}")
         except Exception:
             pass
         try:
@@ -248,15 +354,32 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
             headers["Vary"] = "Accept-Encoding"
         self._send(code, body, "application/json; charset=utf-8", headers)
 
-    def _fail(self, code, msg, close=False, **kw):
+    def _fail(self, status, msg, close=False, why="", retry_after=None, **kw):
+        """统一的失败响应。
+
+        status   : HTTP 状态码（沿用旧位置参数，别改名，几十处调用都是位置传参）
+        why      : 机器可读错误码，只有安全版会写进 JSON 的 "code" 字段；
+                   个人版一个字段都不多，保持 1.4.x 客户端兼容（S-05）。
+        retry_after : 秒数，给了就回 Retry-After 头（429）。
+        """
         if close:
             self.close_connection = True
-        self._json({"ok": False, "error": msg, **kw}, code)
+        body = {"ok": False, "error": msg}
+        if why and is_secure_edition():
+            body["code"] = why
+        body.update(kw)
+        extra = None
+        if retry_after is not None:
+            extra = {"Retry-After": str(int(retry_after))}
+        self._json(body, status, extra=extra)
 
     def _need_auth(self):
         if self._authed():
             return True
-        self._json({"ok": False, "error": "需要配对码", "need_login": True}, 401)
+        body = {"ok": False, "error": "需要配对码", "need_login": True}
+        if is_secure_edition():
+            body["code"] = "AUTH_REQUIRED"
+        self._json(body, 401)
         return False
 
     def _body(self, limit: int = 1 << 20) -> bytes:
@@ -347,9 +470,18 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
         name = download_name or os.path.basename(path)
         ascii_name = name.encode("ascii", "ignore").decode("ascii") or "download"
         ascii_name = ascii_name.replace('"', "_").replace("\\", "_")
-        # HTML / SVG 一律当附件下载：直接在服务源里打开会变成同源脚本执行（DL-08）
-        if ctype.split(";")[0] in ("text/html", "image/svg+xml", "application/xhtml+xml"):
+        # 可执行内容强制下载：直接在服务源里打开会变成同源脚本执行（S-12）。
+        # 安全版扩到 9 种扩展名并统一 octet-stream；个人版保持 1.4.x 的既有行为。
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        html_like = ctype.split(";")[0] in ("text/html", "image/svg+xml", "application/xhtml+xml")
+        if is_secure_edition() and ext in _ACTIVE_CONTENT_EXT:
+            ctype = "application/octet-stream"
             inline = False
+        elif is_secure_edition() and html_like:
+            inline = False
+        elif html_like:
+            # 个人版保持 1.4.x 体验：HTML/SVG 直接在浏览器里打开，不强制下载（P2-1）
+            inline = True
         disp = "inline" if inline else "attachment"
         disposition = f'{disp}; filename="{ascii_name}"; filename*=UTF-8\'\'{urllib.parse.quote(name)}'
 
@@ -484,19 +616,482 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._server_error(exc)
 
+    def _route_other(self):
+        """PUT / DELETE / OPTIONS / PATCH：没有对应业务，但版本专属路径要一致。
+
+        个人版对这些路径仍回 404（不暴露接口存在）、安全版回 501；
+        其余路径保持原有「不支持的方法」语义（501），
+        避免框架默认的 501 HTML 页面被当成「路由存在」的证据。
+        """
+        path, _q = self._parts()
+        if path in ALL_EDITION_ROUTES:
+            # 版本专属路径：当前版本启用了就 501（骨架），没启用就 404
+            if not self._edition_route(path):
+                self._fail(404, "接口不存在", why="NO_ROUTE")
+            return
+        self._send(501, b"", "text/plain; charset=utf-8")
+
+    do_PUT = _route_other
+    do_DELETE = _route_other
+    do_OPTIONS = _route_other
+    do_PATCH = _route_other
+
     def _parts(self):
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
         return urllib.parse.unquote(parsed.path), {k: v[0] for k, v in qs.items()}
 
+    def _edition_route(self, path: str) -> bool:
+        """版本专属路由分发：命中并已回包返回 True，未命中返回 False。
+
+        安全版：证书指纹、设备信任、首次配对轮询、传输前确认（prepare/approve）。
+        个人版不注册这些路径，由调用方继续走到 404。
+        """
+        if path not in EDITION_ROUTES.get(EDITION, ()):
+            return False
+        read_ok = self.command in ("GET", "HEAD")
+        if path == "/api/device":
+            if not read_ok:
+                return self._method_not_allowed()
+            self._api_device()
+        elif path == "/api/login/status":
+            if not read_ok:
+                return self._method_not_allowed()
+            self._api_login_status()
+        elif path == "/api/trust":
+            if not read_ok:
+                return self._method_not_allowed()
+            self._api_trust_list()
+        elif path == "/api/trust/pending":
+            if not read_ok:
+                return self._method_not_allowed()
+            self._api_trust_pending()
+        elif path == "/api/trust/approve":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_trust_approve()
+        elif path == "/api/trust/reject":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_trust_reject()
+        elif path == "/api/trust/revoke":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_trust_revoke()
+        elif path == "/api/trust/auto-accept":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_trust_auto_accept()
+        elif path == "/api/prepare-upload":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_prepare_upload()
+        elif path == "/api/upload/status":
+            if not read_ok:
+                return self._method_not_allowed()
+            self._api_upload_status()
+        elif path == "/api/approve/pending":
+            if not read_ok:
+                return self._method_not_allowed()
+            self._api_approve_pending()
+        elif path == "/api/approve":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_approve_decide()
+        elif path == "/api/approve/cancel":
+            if self.command != "POST":
+                return self._method_not_allowed()
+            self._api_approve_cancel()
+        else:
+            self._json({"ok": False, "error": "not implemented in skeleton"}, code=501)
+        return True
+
+    def _method_not_allowed(self) -> bool:
+        self._fail(405, "方法不允许")
+        return True
+
+    def _qps_ok(self, bucket: str) -> bool:
+        """安全版的分接口限流；个人版恒放行，本机回环豁免（S-07）。"""
+        if not is_secure_edition():
+            return True
+        if self._is_local():
+            return True
+        from dlcore.sec import ratelimit
+        ok, wait = ratelimit.allow(bucket, self.client_address[0])
+        if ok:
+            return True
+        retry = int(wait) if float(wait).is_integer() else int(wait) + 1
+        self._fail(429, "请求过于频繁，请稍后再试", why="RATE_LIMITED",
+                   retry_after=max(1, retry))
+        return False
+
+    def _local_only(self) -> bool:
+        """设备信任相关操作只在本机可用；局域网客户端一律 403。
+
+        额外过一遍 Host / Origin / Sec-Fetch：防止用户浏览器里打开的恶意网页
+        跨站 POST 到 127.0.0.1 来「替自己点批准」。
+        """
+        return (self._is_local() and self._host_ok()
+                and self._origin_ok() and self._fetch_ok())
+
+    def _json_body_or_400(self):
+        try:
+            return self._json_body()
+        except Exception:  # noqa: BLE001
+            self._fail(400, "请求格式错误", close=True)
+            return None
+
+    def _api_device(self):
+        """证书指纹（只读）：给「首次连接时核对指纹」用，不需要登录。"""
+        try:
+            from dlcore.sec import certgen
+            info = certgen.current() or certgen.ensure_cert(verbose=False)
+        except Exception as exc:  # noqa: BLE001
+            return self._fail(503, "证书信息不可用：%s" % exc)
+        return self._json({
+            "ok": True,
+            "edition": EDITION,
+            "fingerprint": info["fingerprint"],
+            "fingerprint_short": info["fingerprint_short"],
+            "not_after": info["not_after"],
+            "sans": info["sans"],
+        })
+
+    # ---------------- 首次配对审批 ----------------
+
+    def _pair_gate(self, data, ip: str, ua: str):
+        """安全版首次配对闸门（覆盖 ApiMixin 的默认空实现）。
+
+        已信任设备 -> 返回 device_id，正常发会话；
+        新设备     -> 只登记请求并回 202，一个字节的会话都不发；
+        参数不对   -> 400。
+        """
+        if not is_secure_edition():
+            return None
+        from dlcore.sec import trust
+        device_id = str(data.get("device_id") or "").strip()
+        if not trust.valid_device_id(device_id):
+            self._fail(400, "缺少或非法的设备标识")
+            return ""
+        if trust.get(device_id) is not None:
+            trust.touch(device_id, ip)
+            return device_id
+        req = trust.request_pair(
+            device_id,
+            str(data.get("device_name") or "").strip(),
+            str(data.get("platform") or "").strip(),
+            ua, ip)
+        log(f"[配对] 新设备待批准：{req['name']}（{redact_ip(ip)}）")
+        self._json({
+            "ok": False,
+            "status": "pending_approval",
+            "request_id": req["request_id"],
+            "expires_in": max(0, int(req["expires_at"] - time.time())),
+        }, code=202)
+        return ""
+
+    def _api_login_status(self):
+        """待批准设备轮询：pending 202 / approved 200 + 会话 Cookie / rejected 403。"""
+        from dlcore.sec import trust
+        q = self._parts()[1]
+        rid = (q.get("request_id") or "").strip()
+        rec = trust.status(rid) if rid else None
+        if rec is None:
+            return self._fail(404, "请求不存在", why="NOT_FOUND")
+        if rec["status"] == "expired":
+            # 过期是明确状态，不是「查无此请求」（P2-1）
+            return self._json({"ok": False, "status": "expired", "code": "GONE"}, code=200)
+        if rec["status"] == "rejected":
+            return self._fail(403, "本机已拒绝该设备", why="FORBIDDEN")
+        if rec["status"] == "approved":
+            extra = None
+            token = rec.get("session_token") or ""
+            if not token:
+                # 批准与发出会话之间有个毫秒级窗口：这里补一次，避免客户端
+                # 恰好在那一刻轮询到 approved 却拿不到 Cookie。
+                token = STATE.new_session(rec["ip"], rec["ua"], device_id=rec["device_id"])
+                trust.attach_session(rid, token)
+            extra = {"Set-Cookie":
+                     "dlsess=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict%s"
+                     % (token, SESSION_ABS_TTL, "; Secure" if is_secure_edition() else "")}
+            return self._json({"ok": True, "status": "approved",
+                               "device": socket.gethostname()}, extra=extra)
+        return self._json({
+            "ok": False, "status": "pending_approval", "request_id": rid,
+            "expires_in": max(0, int(rec["expires_at"] - time.time())),
+        }, code=202)
+
+    # ---------------- 信任列表 ----------------
+
+    def _api_trust_list(self):
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以查看信任列表", why="LOCAL_ONLY")
+        from dlcore.sec import trust
+        return self._json({"ok": True, "devices": trust.list_devices()})
+
+    def _api_trust_pending(self):
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以查看待批准设备", why="LOCAL_ONLY")
+        from dlcore.sec import trust
+        return self._json({"ok": True, "pending": trust.pending_list()})
+
+    def _api_trust_approve(self):
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以批准设备", why="LOCAL_ONLY")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        rid = str(data.get("request_id") or "").strip()
+        from dlcore.sec import trust
+        rec0 = trust.status(rid) if rid else None
+        if rec0 is None:
+            return self._fail(404, "请求不存在", why="NOT_FOUND")
+        if rec0["status"] == "expired":
+            return self._fail(410, "请求已过期", why="GONE")
+        rec = trust.approve(rid)
+        if rec is None:
+            return self._fail(409, "该请求已处理", why="STATE_CONFLICT")
+        token = STATE.new_session(rec["ip"], rec["ua"], device_id=rec["device_id"])
+        trust.attach_session(rid, token)
+        log(f"[配对] 已批准：{rec['name']}（{redact_ip(rec['ip'])}）")
+        return self._json({"ok": True, "request_id": rid,
+                           "device": rec["name"], "ip": rec["ip"]})
+
+    def _api_trust_reject(self):
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以拒绝设备", why="LOCAL_ONLY")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        rid = str(data.get("request_id") or "").strip()
+        from dlcore.sec import trust
+        rec0 = trust.status(rid) if rid else None
+        if rec0 is None:
+            return self._fail(404, "请求不存在", why="NOT_FOUND")
+        if rec0["status"] == "expired":
+            return self._fail(410, "请求已过期", why="GONE")
+        if not trust.reject(rid):
+            return self._fail(409, "该请求已处理", why="STATE_CONFLICT")
+        log(f"[配对] 已拒绝请求 {rid[:6]}")
+        return self._json({"ok": True, "request_id": rid})
+
+    def _api_trust_revoke(self):
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以撤销设备", why="LOCAL_ONLY")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        device_id = str(data.get("device_id") or "").strip()
+        from dlcore.sec import trust
+        if not trust.revoke(device_id):
+            return self._fail(404, "设备不存在", why="NOT_FOUND")
+        n = STATE.revoke_device_sessions(device_id)
+        log(f"[配对] 已撤销设备 {device_id[:6]}，断开 {n} 个会话")
+        return self._json({"ok": True, "sessions": n})
+
+    def _api_trust_auto_accept(self):
+        """每台已信任设备的「自动接受传输」开关（仅本机，落盘）。"""
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以修改自动接受设置", why="LOCAL_ONLY")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        device_id = str(data.get("device_id") or "").strip()
+        enabled = bool(data.get("enabled"))
+        from dlcore.sec import trust
+        if not trust.set_auto_accept(device_id, enabled):
+            return self._fail(404, "设备不存在", why="NOT_FOUND")
+        log(f"[配对] 设备 {device_id[:6]} 自动接受 = {'开' if enabled else '关'}")
+        return self._json({"ok": True, "auto_accept": enabled})
+
+    # ---------------- 传输前确认（S-03 / S-04） ----------------
+
+    def _session_device_id(self) -> str:
+        """当前 Cookie 会话绑定的 device_id（没绑定就是空串）。"""
+        tok = self._cookie_token()
+        if not tok:
+            return ""
+        with STATE.lock:
+            rec = STATE.sessions.get(tok) or {}
+            return str(rec.get("device_id") or "")
+
+    def _api_prepare_upload(self):
+        """阶段一：只收元数据，不落盘；返回 pending（或 auto 时的 accepted + token）。"""
+        if not self._authed():
+            return self._fail(401, "需要配对码", why="AUTH_REQUIRED")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        from dlcore.sec import approval, pathguard, trust
+        dev_id = self._session_device_id()
+        body_id = str(data.get("device_id") or "").strip()
+        if body_id and dev_id and body_id != dev_id:
+            return self._fail(403, "设备标识与会话不一致", why="FORBIDDEN")
+        if not dev_id:
+            return self._fail(403, "本次会话没有绑定设备", why="FORBIDDEN")
+        dev = trust.get(dev_id)
+        if dev is None:
+            return self._fail(403, "这台设备未获信任", why="FORBIDDEN")
+        files = data.get("files")
+        if not isinstance(files, list) or not files:
+            return self._fail(400, "文件列表为空")
+        # 名字与 rel 的每一段都在这里先体检：脏名字根本不进审批队列（S-06）
+        issues = []
+        for raw in files[:200]:
+            if not isinstance(raw, dict):
+                issues.append("文件项格式错误")
+                continue
+            issues += pathguard.audit(str(raw.get("name") or ""))
+            rel = str(raw.get("rel") or "").replace("\\", "/")
+            for seg in [x for x in rel.split("/") if x]:
+                issues += pathguard.audit(seg)
+            try:
+                if int(raw.get("size") or 0) < 0:
+                    issues.append("文件大小无效")
+            except (TypeError, ValueError):
+                issues.append("文件大小无效")
+        if issues:
+            uniq = list(dict.fromkeys(issues))
+            return self._fail(422, "；".join(uniq[:6]), why="INVALID_NAME")
+        rec = approval.prepare(dev_id, dev.get("name") or "", self.client_address[0],
+                               files, auto_accept=bool(dev.get("auto_accept")))
+        log(f"[传输] {dev.get('name') or dev_id[:6]} 申请上传 {rec['file_count']} 个文件"
+              f"（{human_size(rec['total_bytes'])}），状态 {rec['state']}")
+        return self._json(dict(rec, ok=True))
+
+    def _api_upload_status(self):
+        """阶段二之前：设备轮询自己那次申请的状态，accepted 时拿逐文件 token。"""
+        if not self._authed():
+            return self._fail(401, "需要配对码", why="AUTH_REQUIRED")
+        q = self._parts()[1]
+        sid = str(q.get("session_id") or "").strip()
+        from dlcore.sec import approval
+        rec = approval.status(sid)
+        if rec is None:
+            return self._fail(404, "申请不存在", why="NOT_FOUND")
+        if rec["device_id"] != self._session_device_id():
+            return self._fail(403, "不能查看其它设备的申请", why="FORBIDDEN")
+        if rec["state"] in ("expired", "cancelled"):
+            return self._json({"ok": False, "error": "申请已过期或已取消",
+                               "code": "GONE", "state": rec["state"],
+                               "session_id": sid}, code=410)
+        return self._json(dict(approval.view(rec, with_tokens=rec["state"] == "accepted"), ok=True))
+
+    def _api_approve_pending(self):
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以查看待确认传输", why="LOCAL_ONLY")
+        from dlcore.sec import approval
+        return self._json({"ok": True, "sessions": approval.pending()})
+
+    def _api_approve_decide(self):
+        """本机接受 / 拒绝；接受时给每个（或指定）文件签发一次性 token。"""
+        if not self._local_only():
+            return self._fail(403, "只有电脑本机可以确认传输", why="LOCAL_ONLY")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        sid = str(data.get("session_id") or "").strip()
+        action = str(data.get("action") or "").strip()
+        from dlcore.sec import approval
+        rec0 = approval.status(sid)
+        if rec0 is None:
+            return self._fail(404, "申请不存在", why="NOT_FOUND")
+        if rec0["state"] in ("expired", "cancelled"):
+            return self._fail(410, "申请已过期或已取消", why="GONE")
+        if rec0["state"] != "pending":
+            return self._fail(409, "该申请已经处理过了", why="STATE_CONFLICT")
+        if action == "accept":
+            ids = data.get("file_ids")
+            rec = approval.accept(sid, ids if isinstance(ids, list) else None)
+            if rec is None:
+                return self._fail(409, "该申请已经处理过了", why="STATE_CONFLICT")
+            log(f"[传输] 已接受 {sid[:6]}：{len(rec['files'])} 个文件")
+            return self._json({"ok": True, "state": rec["state"],
+                               "session_id": sid})
+        if action == "reject":
+            if not approval.reject(sid):
+                return self._fail(409, "该申请已经处理过了", why="STATE_CONFLICT")
+            log(f"[传输] 已拒绝 {sid[:6]}")
+            return self._json({"ok": True, "state": "rejected", "session_id": sid})
+        return self._fail(400, "action 只能是 accept 或 reject")
+
+    def _api_approve_cancel(self):
+        """取消：电脑本机，或发起这次申请的那台设备。"""
+        if not self._authed() and not self._local_only():
+            return self._fail(403, "没有权限取消这次传输")
+        data = self._json_body_or_400()
+        if data is None:
+            return
+        sid = str(data.get("session_id") or "").strip()
+        from dlcore.sec import approval
+        rec = approval.status(sid)
+        if rec is None:
+            return self._fail(404, "申请不存在", why="NOT_FOUND")
+        if not self._local_only() and rec["device_id"] != self._session_device_id():
+            return self._fail(403, "不能取消其它设备的传输", why="FORBIDDEN")
+        if rec["state"] == "expired":
+            return self._fail(410, "申请已过期", why="GONE")
+        if rec["state"] == "cancelled":
+            return self._fail(409, "这次传输已经取消过了", why="STATE_CONFLICT")
+        if not approval.cancel(sid):
+            return self._fail(409, "这次传输已经处理过了", why="STATE_CONFLICT")
+        log(f"[传输] 已取消 {sid[:6]}")
+        return self._json({"ok": True, "state": "cancelled", "session_id": sid})
+
+    def _upload_gate(self, q):
+        """安全版上传闸门：校验 prepare 阶段下发的逐文件一次性 token。
+
+        返回：True（个人版，沿用原逻辑）/ dict（安全版，已核销，带文件元数据）/ None（已回包）。
+        """
+        if not is_secure_edition():
+            return True
+        if not self._authed():
+            self.close_connection = True
+            self._fail(401, "需要配对码", why="AUTH_REQUIRED")
+            return None
+        from dlcore.sec import approval
+        self._upload_sid = str(q.get("session_id") or "")
+        self._upload_fid = str(q.get("file_id") or "")
+        rec0 = approval.status(self._upload_sid)
+        if rec0 is None:
+            self.close_connection = True
+            self._fail(404, "上传申请不存在", why="NOT_FOUND")
+            return None
+        if rec0["state"] == "rejected":
+            self.close_connection = True
+            self._fail(403, "电脑端拒绝了这次传输", why="TRANSFER_REJECTED")
+            return None
+        if rec0["state"] in ("expired", "cancelled"):
+            self.close_connection = True
+            self._fail(410, "这次传输已过期或已取消", why="GONE")
+            return None
+        if rec0["state"] == "pending":
+            self.close_connection = True
+            self._fail(409, "这次传输还不接受上传", why="STATE_CONFLICT")
+            return None
+        # 同一会话最多 2 个文件同时在写；第三个直接 429，不排队（S-07）
+        if approval.active_uploads(self._upload_sid) >= 2:
+            self.close_connection = True
+            self._fail(429, "同一传输的并发上传过多", why="RATE_LIMITED", retry_after=1)
+            return None
+        rec, f = approval.consume(self._upload_sid, self._upload_fid,
+                                  str(q.get("token") or ""))
+        if rec is None:
+            self.close_connection = True
+            self._fail(403, f or "上传凭证无效", why="TOKEN_INVALID")
+            return None
+        return f
+
+
     def _route_get(self):
-        # Host / Origin 先过一遍：DNS 重绑定的请求会带着攻击者的域名，这里直接拒绝
+        # Host 先过一遍（两版）：DNS 重绑定请求会带攻击者域名，直接 421。
         if not self._host_ok():
             self.close_connection = True
             return self._send(421, b"", "text/plain; charset=utf-8")
-        if not (self._origin_ok() and self._fetch_ok()):
+        # Origin / Sec-Fetch：安全版所有 GET 都查；个人版保持 1.4.x 的宽松（S-13）
+        if is_secure() and not (self._origin_ok() and self._fetch_ok()):
             self.close_connection = True
-            return self._fail(403, "请求来源不被允许")
+            return self._fail(403, "请求来源不被允许", why="BAD_ORIGIN")
 
         path, q = self._parts()
 
@@ -565,9 +1160,13 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
                 return self._serve_file(item["path"])
             return self._dl_page(item["path"], token)
 
+        # ---- 版本专属路由（安全版预留；个人版不注册，继续往下落到 404）----
+        if self._edition_route(path):
+            return
+
         # ---- API ----
         if path == "/api/ping":
-            body = {"ok": True, "ts": time.time()}
+            body = {"ok": True, "ts": time.time(), "edition": EDITION, "version": VERSION}
             try:
                 import dlcore
                 bad = dlcore.degraded_names()
@@ -581,6 +1180,11 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
             if not self._need_auth():
                 return None
             return self.api_session()
+        # 分接口限流放在鉴权前：未登录的洪水同样算数（本机豁免见 _qps_ok）
+        if path in ("/api/list", "/api/search") and not self._qps_ok("list"):
+            return None
+        if path in ("/api/thumb", "/api/preview") and not self._qps_ok("preview"):
+            return None
         if not self._need_auth():
             return None
         if path == "/api/logout":
@@ -623,17 +1227,24 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
             return self.api_peers()
         if path == "/api/inbox":
             return self.api_inbox()
-        return self._fail(404, "接口不存在")
+        return self._fail(404, "接口不存在", why="NO_ROUTE")
 
     def _route_post(self):
         if not self._host_ok():
             self.close_connection = True
             return self._send(421, b"", "text/plain; charset=utf-8")
-        if not (self._origin_ok() and self._fetch_ok()):
-            self.close_connection = True
-            return self._fail(403, "请求来源不被允许")
 
         path, q = self._parts()
+        # 安全版：所有 POST 都过 Origin/Sec-Fetch；个人版只查会改文件系统的 POST（S-13）。
+        # 缺头（老 Android WebView 不发 Sec-Fetch）一律放行，见 _fetch_ok/_origin_ok。
+        if (is_secure() or path in _MUTATING_POSTS) \
+                and not (self._origin_ok() and self._fetch_ok()):
+            self.close_connection = True
+            return self._fail(403, "请求来源不被允许", why="BAD_ORIGIN")
+
+        # ---- 版本专属路由（放在鉴权前：骨架期无论是否登录都回同一状态码）----
+        if self._edition_route(path):
+            return
 
         if path == "/api/login":
             return self.api_login()
@@ -673,5 +1284,5 @@ class Handler(ApiMixin, BaseHTTPRequestHandler):
             return self.api_firewall_remove()
         if path == "/api/open-hotspot":
             return self.api_open_hotspot()
-        return self._fail(404, "接口不存在")
+        return self._fail(404, "接口不存在", why="NO_ROUTE")
 

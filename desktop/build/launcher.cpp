@@ -3,7 +3,8 @@
 // 编译后的 EXE 尾部附加了一整段 payload（Python 运行时 + 应用代码）。
 // 运行逻辑：
 //   1. 从自身尾部定位 payload；
-//   2. 释放到 %LOCALAPPDATA%\DropLink\runtime（已存在且大小一致则跳过）；
+//   2. 释放到 %LOCALAPPDATA%\DropLink\runtime-personal（安全版为 runtime-secure；
+//      已存在且大小一致则跳过）；
 //   3. CreateProcess 拉起 pythonw.exe 运行 app_main.py（无黑色控制台窗口）；
 //   4. 等待子进程结束。
 //
@@ -18,6 +19,20 @@
 
 #ifndef MAX_PATH_W
 #define MAX_PATH_W 4096
+#endif
+
+// 分版（1.5.0）：同一份启动器源码编出两个产物，用编译期宏区分：
+//   DL_RUNTIME_SUBDIR  运行时释放目录（%LOCALAPPDATA%\DropLink\<这个名字>）
+//   DL_MUTEX_NAME      单实例互斥体名
+//   DL_MIGRATE_LEGACY  首次启动把旧的 <DropLink>\runtime 改名搬过来（个人版）
+//   DL_STRIP_SEC       启动前删掉 app\dlcore\sec（个人版：不属于本 edition 的残留）
+// 个人版 = runtime-personal / DropLinkSingleton_Personal_1；
+// 安全版 = runtime-secure / DropLinkSingleton_Secure_1。两版目录与互斥体都分开。
+#ifndef DL_RUNTIME_SUBDIR
+#define DL_RUNTIME_SUBDIR L"runtime-personal"
+#endif
+#ifndef DL_MUTEX_NAME
+#define DL_MUTEX_NAME L"DropLinkSingleton_Personal_1"
 #endif
 
 static const char MAGIC[8] = {'D', 'L', 'P', 'A', 'Y', '0', '0', '1'};
@@ -199,13 +214,59 @@ static bool extractPayload() {
     return true;
 }
 
-static bool getCacheDir() {
-    wchar_t path[MAX_PATH_W];
-    if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path))) {
-        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH_W))
-            wcscpy_s(path, L"C:\\Windows\\Temp");
+#ifdef DL_STRIP_SEC
+// 递归删除目录（个人版清理残留的 dlcore/sec 用）
+static void removeTree(const std::wstring &dir) {
+    std::wstring pattern = dir + L"\\*";
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            std::wstring child = dir + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) removeTree(child);
+            else DeleteFileW(child.c_str());
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
     }
-    g_cacheDir = std::wstring(path) + L"\\DropLink\\runtime";
+    RemoveDirectoryW(dir.c_str());
+}
+#endif
+
+static bool getCacheDir() {
+    // 允许用 DROPLINK_RUNTIME_DIR 直接指定运行时释放目录（便携使用 / 自动化测试）。
+    wchar_t envDir[MAX_PATH_W];
+    DWORD envLen = GetEnvironmentVariableW(L"DROPLINK_RUNTIME_DIR", envDir, MAX_PATH_W);
+    if (envLen > 0 && envLen < MAX_PATH_W) {
+        g_cacheDir = envDir;
+        return true;
+    }
+
+    // 数据根目录：默认 %LOCALAPPDATA%\DropLink；DROPLINK_DATA_DIR 可覆盖（便携/测试）。
+    std::wstring base;
+    wchar_t envBase[MAX_PATH_W];
+    DWORD baseLen = GetEnvironmentVariableW(L"DROPLINK_DATA_DIR", envBase, MAX_PATH_W);
+    if (baseLen > 0 && baseLen < MAX_PATH_W) {
+        base = envBase;
+    } else {
+        wchar_t path[MAX_PATH_W];
+        if (FAILED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, path))) {
+            if (!GetEnvironmentVariableW(L"LOCALAPPDATA", path, MAX_PATH_W))
+                wcscpy_s(path, L"C:\\Windows\\Temp");
+        }
+        base = std::wstring(path) + L"\\DropLink";
+    }
+    g_cacheDir = base + L"\\" + DL_RUNTIME_SUBDIR;
+
+#ifdef DL_MIGRATE_LEGACY
+    // 1.4.x 固定用 <base>\runtime。个人版首次启动把它改名搬过来，
+    // 避免重复释放 15 MB；搬不动（旧进程占用/权限）就直接重建，不阻塞启动。
+    std::wstring legacy = base + L"\\runtime";
+    if (GetFileAttributesW(g_cacheDir.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(legacy.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        MoveFileExW(legacy.c_str(), g_cacheDir.c_str(), 0);
+    }
+#endif
     return true;
 }
 
@@ -270,7 +331,7 @@ static bool launchApp(int port) {
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
     // 单实例：已经在跑时，把界面窗口置顶（而不是再开一个）
-    HANDLE mx = CreateMutexW(NULL, FALSE, L"DropLinkSingleton_1");
+    HANDLE mx = CreateMutexW(NULL, FALSE, DL_MUTEX_NAME);
     if (mx && GetLastError() == ERROR_ALREADY_EXISTS) {
         // 界面窗口标题 = manifest 里的应用名
         HWND w = FindWindowW(NULL, L"DropLink 互传");
@@ -299,6 +360,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
 
     if (!extractPayload()) return 1;
 
+#ifdef DL_STRIP_SEC
+    // 个人版 payload 里没有 sec/：如果它还在（旧版共用 runtime 被迁移过来，
+    // 或曾经用安全版解包到同一个目录），先整个删掉再启动。
+    {
+        std::wstring sec = g_cacheDir + L"\\app\\dlcore\\sec";
+        if (GetFileAttributesW(sec.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            removeTree(sec);
+        }
+    }
+#endif
+
     std::wstring py = g_cacheDir + L"\\pythonw.exe";
     std::wstring script = g_cacheDir + L"\\app\\app_main.py";
     if (GetFileAttributesW(py.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -310,16 +382,22 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR cmdLine, int) {
     std::wstring cmd = py;
     appendArg(cmd, script);
     if (cmdLine && *cmdLine) {
-        // 简单按空格切分（本程序自身参数很少）
+        // 支持 "带空格的路径"：按空格切分，但引号内的空格保留、引号本身去掉。
+        // 旧实现把引号当普通字符，导致 --recv "E:\a b" 变成带引号的路径，
+        // 服务端 makedirs 失败后悄悄回落到默认目录。
+        std::vector<std::wstring> args;
         std::wstring cur;
+        bool inQuote = false;
         for (const wchar_t *p = cmdLine; *p; ++p) {
-            if (*p == L' ') {
-                if (!cur.empty()) { appendArg(cmd, cur); cur.clear(); }
+            if (*p == L'"') { inQuote = !inQuote; continue; }
+            if (*p == L' ' && !inQuote) {
+                if (!cur.empty()) { args.push_back(cur); cur.clear(); }
             } else {
                 cur += *p;
             }
         }
-        if (!cur.empty()) appendArg(cmd, cur);
+        if (!cur.empty()) args.push_back(cur);
+        for (size_t i = 0; i < args.size(); ++i) appendArg(cmd, args[i]);
     }
 
     STARTUPINFOW si;

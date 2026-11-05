@@ -309,7 +309,8 @@ class DropLinkWindow:
 
     def __init__(self, info):
         self.info = info
-        self.url = (info["urls"][0] if info.get("urls") else f"http://127.0.0.1:{info['port']}")
+        self.url = (info["urls"][0] if info.get("urls") else
+                    (info.get("local_url") or f"http://127.0.0.1:{info['port']}"))
         self.s = dpi_scale()
         self.hwnd = None
         self.tray_added = False
@@ -562,16 +563,17 @@ class DropLinkWindow:
         user32.InvalidateRect(self.hwnd, None, True)
 
     def open_ui(self):
+        base = self.info.get("local_url") or f"http://127.0.0.1:{self.info['port']}"
         try:
             import server
             tok = self.info.get("local_token") or ""
             suffix = ("?k=" + tok) if tok else ""
-            server.open_app_window(f"http://127.0.0.1:{self.info['port']}/{suffix}")
+            server.open_app_window(f"{base}/{suffix}")
         except Exception:
             import webbrowser
             tok = self.info.get("local_token") or ""
             suffix = ("?k=" + tok) if tok else ""
-            webbrowser.open(f"http://127.0.0.1:{self.info['port']}/{suffix}")
+            webbrowser.open(f"{base}/{suffix}")
 
     def open_dir(self):
         try:

@@ -18,7 +18,8 @@
 
 | Platform | File | Size | Notes |
 |---|---|---|---|
-| **Windows 10 / 11** | [`DropLink.exe`](https://github.com/HU4222/droplink/releases/latest/download/DropLink.exe) | ~14 MB | Single portable executable, no install, no Python needed |
+| **Windows 10 / 11** | [`DropLink.exe`](https://github.com/HU4222/droplink/releases/latest/download/DropLink.exe) | ~15 MB | **Personal edition** — portable, no install, no Python needed |
+| **Windows 10 / 11** | [`DropLink-Secure.exe`](https://github.com/HU4222/droplink/releases/latest/download/DropLink-Secure.exe) | ~25 MB | **Secure edition** — TLS, device approval, confirm-before-receive |
 | **Android 8.0+** | [`DropLink-Android.apk`](https://github.com/HU4222/droplink/releases/latest/download/DropLink-Android.apk) | ~1.2 MB | Sideload; "Install unknown apps" must be allowed |
 | **iPhone / iPad / HarmonyOS** | — no install — | — | Open the address shown on the desktop in any browser; everything except background resume and notification actions works the same |
 | Checksums | [`SHA256SUMS.txt`](https://github.com/HU4222/droplink/releases/latest/download/SHA256SUMS.txt) | 1 KB | Verify your download |
@@ -75,7 +76,7 @@ Typical uses: moving photos off your phone without a cable, grabbing a document 
 
 1. **Run `DropLink.exe` on the PC.** A window opens showing a QR code, your LAN address (e.g. `http://192.168.1.7:8848`) and a 6-digit pairing code.
 2. **Connect the phone** — either scan the QR code with the Android app, or type the address into any browser on the same Wi-Fi.
-3. **Pair once.** Enter the 6-digit code. After that the phone stays logged in; the PC remembers the device.
+3. **Pair once.** Enter the pairing code — 6 digits on the personal edition, **8 digits on the secure edition** (which also asks you to approve the device on the PC).
 
 Files you send from the phone land in `Desktop\DropLink 接收` by default; you can change the receive folder from the PC window.
 
@@ -88,7 +89,9 @@ Files you send from the phone land in `Desktop\DropLink 接收` by default; you 
 ```
 .
 ├── desktop/                 Windows / Python side
-│   ├── server.py            HTTP server + file, clipboard and push APIs
+│   ├── server.py            HTTP server entry point
+│   ├── dlcore/              config / state / fsutil / api / httpd …
+│   ├── dlcore/sec/          secure edition only: TLS, trust, approval, pathguard, ratelimit
 │   ├── app_main.py          EXE entry point (start server, tray, open UI)
 │   ├── gui.py               Native window + tray icon (ctypes → Win32)
 │   ├── qrmini.py            Dependency-free QR code and icon renderer
@@ -114,10 +117,10 @@ DropLink is designed for **trusted home / office networks**. That is a deliberat
 
 - The default ("personal") mode trusts requests coming from the machine itself, so the PC UI opens without a password. A 6-digit pairing code gates every other device.
 - Traffic is plain HTTP on the LAN. On a network you do not control (café Wi-Fi, hotel), someone who can sniff traffic could read it. Use your phone's hotspot instead.
-- Start the server with `--secure` to turn on the hardened profile: Host/Origin validation, a one-time token for the local UI, sensitive-directory blocking, UNC/ADS path rejection, 8-digit pairing code and a 30-day session limit.
+- **Since 1.5.0 there are two builds from the same codebase.** `DropLink.exe` (personal) keeps the plain-HTTP, no-approval behaviour described above. `DropLink-Secure.exe` is the hardened profile, always on: TLS with a self-signed certificate, device approval, confirm-before-receive, per-file one-time upload tokens, path hardening (UNC / ADS / reparse points / reserved names), per-endpoint rate limiting, log redaction and quota. The two builds do not interoperate.
 - The phone app can write only into its receive folder when driven from the PC; the phone's own UI keeps full access.
 
-See [`docs/SECURITY.md`](docs/SECURITY.md) for the full threat model.
+See [`SECURITY.md`](SECURITY.md) for the full threat model, including what DropLink explicitly does **not** protect against.
 
 > **中文**：DropLink 面向**可信的家庭/办公局域网**，这是有意的取舍：默认「个人模式」信任本机请求，所以电脑界面不需要密码，其它设备凭 6 位配对码接入；局域网内是明文 HTTP，在不可控的网络（咖啡厅、酒店）请改用手机热点。启动时加 `--secure` 可开启加固模式：Host/Origin 校验、本机一次性令牌、敏感目录屏蔽、拒绝 UNC/ADS 路径、8 位配对码、会话 30 天过期。完整威胁模型见 `docs/SECURITY.md`。
 
@@ -155,7 +158,8 @@ Details and troubleshooting: [`docs/BUILD.md`](docs/BUILD.md).
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | How the pieces fit: HTTP server, WebView host, threading model, data flow |
 | [`docs/API.md`](docs/API.md) | Every HTTP endpoint with parameters and responses |
 | [`docs/BUILD.md`](docs/BUILD.md) | Full build instructions for both platforms, signing, packaging |
-| [`docs/SECURITY.md`](docs/SECURITY.md) | Threat model, personal vs `--secure` profile, known limits |
+| [`SECURITY.md`](SECURITY.md) | Threat model, personal vs secure edition, what is explicitly out of scope |
+| [`docs/EDITIONS.md`](docs/EDITIONS.md) | Personal vs secure: defaults, error codes, rate limits, quota |
 | [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) | "Phone can't connect", firewall, AP isolation, VPN, port conflicts |
 | [`CHANGELOG.md`](CHANGELOG.md) | Version history |
 

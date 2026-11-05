@@ -2,6 +2,21 @@
 
 All notable changes to DropLink. Download links point at the latest release.
 
+## v1.5.0 — 2026-11-05
+
+**Two editions**
+
+- The same codebase now ships two builds. `DropLink.exe` is the **personal** edition (unchanged behaviour, plain HTTP, 6-digit code). `DropLink-Secure.exe` is the **secure** edition, hardened by default and not switchable to plaintext.
+- Secure edition adds: TLS 1.3 with a self-signed ECDSA P-256 certificate (refuses to start without one), device trust with on-PC approval and revocation, metadata-first transfer confirmation (nothing hits disk before you accept), per-file one-time upload tokens bound to session+file, machine-readable error codes (401/403/409/410/422/429/507), write-path hardening (traversal, UNC, ADS, reparse points, reserved names, depth > 32), per-endpoint token-bucket rate limiting, log redaction with timestamps, receive-folder quota and strict `.part` sweeping, and web hardening (Secure cookie, Origin/Sec-Fetch checks, Host allow-list, forced download for HTML/SVG).
+- New `VERSION` file at the repo root is the release baseline; the build now fails if `config.VERSION`, `README` and `docs/EDITIONS.md` disagree with it.
+- Build self-check refuses to package runtime state (certs, trust list, logs) or the secure modules into the personal build.
+
+**Android 1.4.8**
+
+- Search works again: the server returned `results` while the UI read `entries`. Also fixed IME composition and Enter-to-search.
+
+> **中文**：1.5.0 起同一份代码出两个产物——个人版行为不变；安全版默认就是加固形态（TLS、设备审批、传输前确认、逐文件一次性 token、状态码语义、路径加固、限流、日志脱敏、配额、Web 面加固），拿不到证书直接拒绝启动。构建引入 `VERSION` 发布基线，版本漂移会直接构建失败。安卓 1.4.8 修复了搜索永远为空（字段名 `results`/`entries` 不一致）。
+
 ## v1.4.7 — 2026-11-04
 
 **Naming**

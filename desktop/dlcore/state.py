@@ -111,11 +111,12 @@ class State:
 
     # ---- 会话（修复 DL-03：过期、吊销、上限）----
 
-    def new_session(self, ip: str, ua: str) -> str:
+    def new_session(self, ip: str, ua: str, device_id: str = "") -> str:
         token = secrets.token_urlsafe(24)
         now = time.time()
         with self.lock:
-            self.sessions[token] = {"ts": now, "last": now, "ip": ip, "ua": ua[:120]}
+            self.sessions[token] = {"ts": now, "last": now, "ip": ip, "ua": ua[:120],
+                                    "device_id": device_id}
             # 超出上限时踢掉最久未使用的
             if len(self.sessions) > MAX_SESSIONS:
                 old = sorted(self.sessions.items(), key=lambda kv: kv[1]["last"])
@@ -150,6 +151,16 @@ class State:
             n = len(self.sessions)
             self.sessions.clear()
             return n
+
+    def revoke_device_sessions(self, device_id: str) -> int:
+        """撤销某台已信任设备时，把它所有会话立刻作废（下一次请求 401）。"""
+        if not device_id:
+            return 0
+        with self.lock:
+            dead = [k for k, v in self.sessions.items() if v.get("device_id") == device_id]
+            for k in dead:
+                self.sessions.pop(k, None)
+            return len(dead)
 
     def cleanup(self):
         """定期清理过期会话、失败的登录记录、离线设备，避免长期运行内存增长。"""

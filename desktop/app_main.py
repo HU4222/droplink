@@ -21,7 +21,7 @@ def _redirect_output():
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         logdir = os.path.join(base, "DropLink")
         os.makedirs(logdir, exist_ok=True)
-        f = open(os.path.join(logdir, "droplink.log"), "a", encoding="utf-8")
+        f = open(os.path.join(logdir, "droplink.log"), "a", encoding="utf-8", buffering=1)
         f.write("\n===== %s =====\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
         f.flush()
     except Exception:
@@ -77,6 +77,10 @@ def parse_args(argv):
 def main():
     _set_app_user_model_id()
     if "--selfcheck" in sys.argv[1:]:
+        print("版本身份：edition=%s（%s）  v%s" % (
+            server.config.EDITION,
+            "安全版" if server.config.is_secure_edition() else "个人版",
+            server.VERSION))
         print(server.health_line())
         for item in server.describe():
             print("  %-2s dlcore/%-9s %-8s %s" % (
@@ -88,6 +92,11 @@ def main():
         server.config.set_secure(True)
 
     # 有模块没起来时先在控制台说清楚，再决定走完整模式还是降级模式（1.4.2）
+    # 安全版：先在打印「降级运行」之前分流，避免文案自相矛盾（P3-2）。
+    if not server.module_ok("httpd") and server.config.is_secure_edition():
+        server.print_refuse_degraded()   # pythonw 下会写进 droplink.log
+        return 2
+
     server.print_degraded_report()
 
     if not server.module_ok("httpd"):
@@ -122,7 +131,8 @@ def main():
     try:
         info = server.start_server(port, pin, recv, background=True)
     except RuntimeError as exc:
-        print(str(exc))
+        # pythonw 下 stdout/stderr 都指向同一个日志文件，只写一次
+        print(str(exc), file=sys.stderr)
         return 1
 
     # 把实际端口写进运行时目录，供「再次双击 EXE」时重新打开界面用
@@ -134,7 +144,7 @@ def main():
         pass
 
     if not use_gui:
-        server.print_banner(info["port"], info["urls"])
+        server.print_banner(info["port"], info["urls"], info.get("cert"))
         try:
             while True:
                 time.sleep(1)
@@ -149,7 +159,9 @@ def main():
                 # 唯一可见界面：直接进「连接信息」页（二维码 + 地址 + 配对码）
                 # 带本机令牌，服务端才认这是程序自己打开的窗口（不是任意网页）
                 server.open_app_window(
-                    "http://127.0.0.1:%d/?k=%s#about" % (info["port"], info["local_token"]))
+                    "%s/?k=%s#about" % (info.get("local_url") or
+                                        "http://127.0.0.1:%d" % info["port"],
+                                        info["local_token"]))
             except Exception:
                 pass
 

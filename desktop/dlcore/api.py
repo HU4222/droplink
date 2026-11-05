@@ -28,6 +28,8 @@ import zlib
 
 from .config import *
 from .config import is_secure
+from .config import is_secure_edition
+from .logsafe import log, redact_ip, redact_path, safe_exc
 from .fsutil import *
 from .media import *
 from .winenv import *
@@ -38,11 +40,64 @@ from .winenv import _all_ips, _fw_rule_detail, _has_fw_rule, _net_profiles, _run
 from .fsutil import _sensitive_roots
 from .fsutil import SESSION_ABS_TTL
 
+# --------------------------------------------------------------------------
+# S-11 接收目录配额
+# --------------------------------------------------------------------------
+_QUOTA_CACHE = {"dir": "", "ts": 0.0, "size": 0}
+
+
+def quota_bytes() -> int:
+    """DROPLINK_QUOTA_MB（测试用）优先，其次 DROPLINK_QUOTA_GB；0 = 不限。"""
+    mb = os.environ.get("DROPLINK_QUOTA_MB")
+    if mb:
+        try:
+            return int(float(mb) * 1024 * 1024)
+        except (TypeError, ValueError):
+            pass
+    gb = os.environ.get("DROPLINK_QUOTA_GB")
+    if gb:
+        try:
+            return int(float(gb) * 1024 ** 3)
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
+def recv_usage() -> int:
+    """接收目录已用空间（不含推送暂存），5 秒缓存，避免每次上传都全盘遍历。"""
+    now = time.time()
+    if _QUOTA_CACHE["dir"] == STATE.recv_dir and now - _QUOTA_CACHE["ts"] < 5:
+        return _QUOTA_CACHE["size"]
+    total = 0
+    try:
+        for root, dirs, files in os.walk(STATE.recv_dir):
+            dirs[:] = [d for d in dirs if d != ".droplink-send"]
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    _QUOTA_CACHE.update({"dir": STATE.recv_dir, "ts": now, "size": total})
+    return total
+
+
 class ApiMixin:
     """所有 /api/* 的实现。依赖 Handler 的 _json/_fail/_serve_file 等传输层方法。"""
+    def _pair_gate(self, data, ip: str, ua: str):
+        """安全版首次配对闸门；个人版没有设备审批，直接返回 None。
+
+        返回值约定（实现见 dlcore/httpd.py）：
+            None        -> 不启用设备审批（个人版），按原逻辑发会话
+            ""          -> 已经回包（请求已挂起或参数不合法），调用方直接 return
+            "device_id" -> 设备已信任，放行，并把这个 id 记进会话
+        """
+        return None
 
     def api_session(self):
-        urls = lan_urls(self.server.server_port)
+        scheme = getattr(self.server, "scheme", "http")
+        urls = lan_urls(self.server.server_port, scheme)
         local_ui = self._local_ui()
         info = {
             "ok": True,
@@ -54,11 +109,13 @@ class ApiMixin:
             "version": VERSION,
             "recv_dir": STATE.recv_dir,
             "uptime": int(time.time() - STATE.started),
+            "scheme": scheme,
             "lan_urls": urls,
             "qr_target": urls[0] if urls else "",
             "qr_available": qr_available(),
             "thumb_available": has_pillow(),
             "pin_length": len(STATE.pin),
+            "secure": is_secure_edition(),
         }
         # 配对码只给「本机 + 令牌」的界面，任何网络请求都拿不到（修复 DL-05）
         if local_ui:
@@ -69,7 +126,8 @@ class ApiMixin:
         if self._token_ok() and not self._cookie_token():
             tok = STATE.new_session(self.client_address[0], "local-ui")
             extra = {"Set-Cookie":
-                     f"dlsess={tok}; Path=/; Max-Age={SESSION_ABS_TTL}; HttpOnly; SameSite=Strict"}
+                     f"dlsess={tok}; Path=/; Max-Age={SESSION_ABS_TTL}; HttpOnly; SameSite=Strict"
+                     + ("; Secure" if is_secure_edition() else "")}
         self._json(info, extra=extra)
 
     def api_login(self):
@@ -84,6 +142,9 @@ class ApiMixin:
             # 指数退避：连续失败后锁 60s → 120s → 240s（上限 5 分钟）
             wait = min(300, 60 * (2 ** max(0, rec["count"] - 5)))
             if now - rec["ts"] < wait:
+                if is_secure_edition():
+                    return self._fail(429, "尝试次数过多，请稍后再试",
+                                      why="RATE_LIMITED", retry_after=wait)
                 return self._fail(429, "尝试次数过多，请稍后再试")
         pin = data.get("pin")
         # 严格 schema：只接受字符串，拒绝数字/数组/对象与重复键（修复 X-09）
@@ -95,23 +156,36 @@ class ApiMixin:
             else:
                 rec["count"] += 1
                 rec["ts"] = now
+            if is_secure_edition():
+                return self._fail(401, "配对码不正确", why="AUTH_BAD_PIN")
             return self._fail(403, "配对码不正确")
         ua = (self.headers.get("User-Agent") or "")[:120]
-        token = STATE.new_session(ip, ua)
+        # 安全版：未登记设备不发会话，挂起等电脑本机批准（个人版这一步恒为 None）
+        gate = self._pair_gate(data, ip, ua)
+        if gate == "":
+            STATE.fails.pop(ip, None)
+            return
+        token = STATE.new_session(ip, ua, device_id=gate or "")
         STATE.fails.pop(ip, None)
         name = str(data.get("name") or "").strip()[:40]
         with STATE.lock:
             STATE.peers[ip] = {"ts": now, "ua": ua, "name": name or device_name_of(ua)}
         STATE.cleanup()
-        print(f"[接入] {name or ip} 已配对成功")
-        cookie = f"dlsess={token}; Path=/; Max-Age={SESSION_ABS_TTL}; HttpOnly; SameSite=Strict"
+        log(f"[接入] {name or redact_ip(ip)} 已配对成功")
+        attrs = "Path=/; Max-Age=%d; HttpOnly; SameSite=Strict" % SESSION_ABS_TTL
+        if is_secure_edition():
+            attrs += "; Secure"
+        cookie = "dlsess=%s; %s" % (token, attrs)
         self._json({"ok": True, "device": socket.gethostname()}, extra={"Set-Cookie": cookie})
 
     def api_logout(self):
         tok = self._cookie_token()
         if tok:
             STATE.revoke_session(tok)
-        cookie = "dlsess=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+        attrs = "Path=/; Max-Age=0; HttpOnly; SameSite=Strict"
+        if is_secure_edition():
+            attrs += "; Secure"
+        cookie = "dlsess=; " + attrs
         self._json({"ok": True}, extra={"Set-Cookie": cookie})
 
     def api_sessions(self):
@@ -588,9 +662,10 @@ class ApiMixin:
             host = self.headers.get("Host") or ""
             bare = (host.rsplit(":", 1)[0] if ":" in host else host).strip("[]").lower()
             if not host or bare not in allow or bare in ("127.0.0.1", "localhost", "::1"):
-                urls = lan_urls(self.server.server_port)
-                host = urls[0].replace("http://", "") if urls else f"127.0.0.1:{self.server.server_port}"
-        self._json({"ok": True, "url": f"http://{host}/dl/{token}"})
+                urls = lan_urls(self.server.server_port, getattr(self.server, "scheme", "http"))
+                host = urls[0].split("://", 1)[-1] if urls else f"127.0.0.1:{self.server.server_port}"
+        scheme = getattr(self.server, "scheme", "http")
+        self._json({"ok": True, "url": f"{scheme}://{host}/dl/{token}"})
 
     def api_set_config(self):
         if not self._local_ui():
@@ -674,7 +749,8 @@ class ApiMixin:
             return self._fail(403, "只有电脑本机可以诊断")
         return self._json({
             "ok": True,
-            "urls": lan_urls(self.server.server_port),
+            "scheme": getattr(self.server, "scheme", "http"),
+            "urls": lan_urls(self.server.server_port, getattr(self.server, "scheme", "http")),
             "fw_rule": _has_fw_rule(),
             "fw_detail": _fw_rule_detail(),
             "profiles": _net_profiles(),
@@ -806,10 +882,31 @@ class ApiMixin:
 
     # ---------------- 上传 ----------------
 
+    def _upload_finish(self, ok: bool) -> None:
+        """把这次文件上传的结果回写到审批会话（成功 done / 失败 failed）。"""
+        sid = getattr(self, "_upload_sid", "")
+        fid = getattr(self, "_upload_fid", "")
+        if not sid or not fid:
+            return
+        try:
+            from dlcore.sec import approval
+            approval.finish(sid, fid, ok)
+        except Exception:
+            pass
+
     def api_upload(self, q):
+        # 安全版上传接口限流（个人版恒放行）
+        if not self._qps_ok("upload"):
+            return
         if not self._authed():
             self.close_connection = True
-            return self._fail(401, "需要配对码")
+            return self._fail(401, "需要配对码", why="AUTH_REQUIRED")
+
+        # 安全版：必须有 prepare-upload 下发的一次性 token；个人版这一关直接放行
+        gate = self._upload_gate(q)
+        if gate is None:
+            return
+        prepared = None if gate is True else gate
 
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -821,32 +918,102 @@ class ApiMixin:
         if length > 64 * 1024 ** 3:
             self.close_connection = True
             return self._fail(413, "文件过大")
+        if prepared is not None:
+            want = int(prepared.get("size") or 0)
+            if length != want:
+                self.close_connection = True
+                log("[上传] %s 声明 %d 字节，实际 Content-Length=%d，已断开"
+                      % (redact_path(prepared.get("name")), want, length))
+                # 一个字节都没读：换发新 token 还回去（旧 token 立即作废，P3-3）
+                new_token = ""
+                try:
+                    from dlcore.sec import approval
+                    new_token = approval.release(self._upload_sid, self._upload_fid) or ""
+                except Exception:
+                    new_token = ""
+                body = {"ok": False, "error": "文件大小与申请时不一致",
+                        "code": "SIZE_MISMATCH", "file_id": self._upload_fid}
+                if new_token:
+                    body["token"] = new_token
+                return self._json(body, 422)
 
-        rel = str(q.get("rel") or "").replace("\\", "/")
+        if prepared is not None:
+            rel = str(prepared.get("rel") or "").replace("\\", "/")
+        else:
+            rel = str(q.get("rel") or "").replace("\\", "/")
         try:
             parts = [strict_name(p) for p in rel.split("/") if p and p not in (".", "..")]
-            name = strict_name(q.get("name") or (parts[-1] if parts else "file"), "file")
+            if prepared is not None:
+                name = strict_name(prepared.get("name") or "file", "file")
+            else:
+                name = strict_name(q.get("name") or (parts[-1] if parts else "file"), "file")
         except ValueError as exc:
             self.close_connection = True
-            return self._fail(400, str(exc))
+            self._upload_finish(False)
+            # 安全版按 S-05 用 422，个人版保持 1.4.x 的 400（Android 客户端按旧语义解析）
+            code_http = 422 if is_secure_edition() else 400
+            return self._fail(code_http, str(exc), why="INVALID_NAME")
         # rel 既可能是「目录」（配合 name），也可能是「目录/文件名」（浏览器 webkitRelativePath）。
         # 只有最后一段与文件名一致时才把它当文件名去掉，否则全部当目录。
         sub_dirs = parts[:-1] if (parts and parts[-1] == name) else parts
 
+        # 安全版：目录深度上限 32 段（不含文件名本身；S-12）。个人版保持 1.4.x 行为。
+        if prepared is not None and len(sub_dirs) > 32:
+            self.close_connection = True
+            self._upload_finish(False)
+            return self._fail(422, "目录层级过深（>32）", why="INVALID_NAME")
+
+        # 安全版：逐段体检（目录段也会变成真实目录名，不能只查最后一段）
+        pathguard = None
+        if prepared is not None:
+            from dlcore.sec import pathguard as _pg
+            pathguard = _pg
+            issues = []
+            for seg in list(sub_dirs) + [name]:
+                issues += pathguard.audit(seg)
+            if issues:
+                self.close_connection = True
+                self._upload_finish(False)
+                return self._fail(422, "；".join(list(dict.fromkeys(issues))[:6]),
+                                  why="INVALID_NAME")
+
         dest_dir = os.path.join(STATE.recv_dir, *sub_dirs) if sub_dirs else STATE.recv_dir
         dest_dir = os.path.abspath(dest_dir)
-        if not inside(dest_dir, STATE.recv_dir):
+        if prepared is not None:
+            try:
+                dest_dir = pathguard.check_upload_path(STATE.recv_dir, dest_dir)
+            except ValueError as exc:
+                self.close_connection = True
+                self._upload_finish(False)
+                return self._fail(422, str(exc), why="INVALID_NAME")
+        elif not inside(dest_dir, STATE.recv_dir):
             self.close_connection = True
+            self._upload_finish(False)
             return self._fail(403, "只能上传到接收目录")
         try:
             os.makedirs(dest_dir, exist_ok=True)
         except OSError:
             self.close_connection = True
+            self._upload_finish(False)
             return self._fail(500, "无法创建目录")
         # 目录建好后再确认一次：已有 junction 会把写入引到接收目录之外（修复 X-03）
-        if not inside(dest_dir, STATE.recv_dir):
+        if prepared is not None:
+            try:
+                dest_dir = pathguard.check_upload_path(STATE.recv_dir, dest_dir)
+            except ValueError as exc:
+                self.close_connection = True
+                self._upload_finish(False)
+                return self._fail(422, str(exc), why="INVALID_NAME")
+        elif not inside(dest_dir, STATE.recv_dir):
             self.close_connection = True
+            self._upload_finish(False)
             return self._fail(403, "该目录指向接收目录之外")
+
+        quota = quota_bytes()
+        if quota and recv_usage() + length > quota:
+            self.close_connection = True
+            self._upload_finish(False)
+            return self._fail(507, "接收目录配额已满（DROPLINK_QUOTA_GB）", why="DISK_FULL")
 
         try:
             free = shutil.disk_usage(dest_dir).free
@@ -854,11 +1021,14 @@ class ApiMixin:
             free = 0
         if free and free < length + (256 << 20):
             self.close_connection = True
-            return self._fail(507, "磁盘剩余空间不足")
+            self._upload_finish(False)
+            return self._fail(507, "磁盘空间不足", why="DISK_FULL")
 
         tmp_path = os.path.join(dest_dir, f".dl_{secrets.token_hex(4)}.part")
         started = time.time()
         written = 0
+        want_sha = str((prepared or {}).get("sha256") or "").lower()
+        digest = hashlib.sha256() if want_sha else None
         try:
             with open(tmp_path, "wb") as f:
                 left = length
@@ -867,17 +1037,24 @@ class ApiMixin:
                     if not buf:
                         break
                     f.write(buf)
+                    if digest is not None:
+                        digest.update(buf)
                     written += len(buf)
                     left -= len(buf)
                 f.flush()
                 os.fsync(f.fileno())
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
             self.close_connection = True
-            return self._fail(500, "写入文件失败")
+            self._upload_finish(False)
+            log("[上传] 写入失败：%s" % safe_exc(exc))
+            msg = "写入文件失败"
+            if os.environ.get("DROPLINK_DEBUG") == "1":
+                msg += "：" + repr(exc)
+            return self._fail(500, msg)
 
         if written != length:
             try:
@@ -885,7 +1062,18 @@ class ApiMixin:
             except OSError:
                 pass
             self.close_connection = True
+            self._upload_finish(False)
             return self._fail(400, f"文件不完整（{written}/{length}）")
+
+        if digest is not None and digest.hexdigest() != want_sha:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            self.close_connection = True
+            self._upload_finish(False)
+            log("[上传] %s 校验和与声明不符，已丢弃" % redact_path(prepared.get("name")))
+            return self._fail(422, "文件校验失败（内容与声明不符）", why="CHECKSUM_MISMATCH")
 
         try:
             target = claim_path(tmp_path, dest_dir, name)   # 原子抢名，防并发覆盖（X-04）
@@ -894,13 +1082,27 @@ class ApiMixin:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+            self._upload_finish(False)
             return self._fail(500, "无法分配文件名")
         except OSError:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+            self._upload_finish(False)
             return self._fail(500, "保存文件失败")
+
+        # 最后一道：rename 之后的目标也必须仍在接收目录内、且不经过重解析点
+        if prepared is not None:
+            try:
+                pathguard.check_upload_path(STATE.recv_dir, target)
+            except ValueError as exc:
+                try:
+                    os.unlink(target)
+                except OSError:
+                    pass
+                self._upload_finish(False)
+                return self._fail(422, str(exc), why="INVALID_NAME")
 
         risky = mark_risky_file(target)
 
@@ -917,8 +1119,9 @@ class ApiMixin:
         elapsed = max(0.001, time.time() - started)
         STATE.add_transfer(direction="up", name=os.path.basename(target), size=length,
                            peer=self.client_address[0], speed=length / elapsed)
-        print(f"[接收] {os.path.basename(target)}  {human_size(length)}  "
+        log(f"[接收] {redact_path(target)}  {human_size(length)}  "
               f"{human_size(int(length / elapsed))}/s")
+        self._upload_finish(True)
 
         self._json({"ok": True, "saved": target, "name": os.path.basename(target),
                     "size": length, "elapsed": round(elapsed, 2),

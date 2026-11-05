@@ -44,6 +44,7 @@ import zlib
 
 from dlcore import config
 from dlcore.config import *          # noqa: F401,F403  （保持 server.APP_NAME / VERSION 可用）
+from dlcore.logsafe import log, mask, redact_ip, redact_path
 from dlcore.state import STATE       # noqa: F401
 from dlcore.fsutil import *          # noqa: F401,F403
 from dlcore.media import *           # noqa: F401,F403
@@ -95,21 +96,47 @@ def open_app_window(url: str) -> bool:
         return False
 
 
-def print_banner(port: int, urls):
+def _redact_url(u: str) -> str:
+    """日志/非交互输出里的 URL：把主机换成打码后的形式。"""
+    try:
+        p = urllib.parse.urlsplit(u)
+        host = p.hostname or ""
+        netloc = redact_ip(host)
+        if p.port:
+            netloc += ":%d" % p.port
+        return urllib.parse.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
+    except Exception:
+        return redact_path(u)
+
+
+def print_banner(port: int, urls, cert=None):
     line = "=" * 62
+    scheme = "https" if cert else "http"
+    # 人看的横幅在终端里显示完整信息；输出被重定向到日志/管道时自动脱敏（S-10）。
+    try:
+        human = bool(sys.stdout and sys.stdout.isatty())
+    except Exception:
+        human = False
+    pin_show = STATE.pin if human else mask(STATE.pin)
+    recv_show = STATE.recv_dir if human else redact_path(STATE.recv_dir)
+    urls_show = urls if human else [_redact_url(u) for u in urls]
     print()
     print(line)
     print(f"  {APP_NAME}  v{VERSION}   ·   同一个 Wi-Fi，发送端与接收端直连互传")
+    if cert:
+        print("  安全版：TLS 已启用（自签证书，浏览器首次打开会提示，确认后继续）")
     print(line)
-    print(f"  接收端本机：  http://127.0.0.1:{port}")
-    if urls:
-        print(f"  发送端打开：  {urls[0]}")
-        for extra in urls[1:]:
+    print(f"  接收端本机：  {scheme}://127.0.0.1:{port}")
+    if urls_show:
+        print(f"  发送端打开：  {urls_show[0]}")
+        for extra in urls_show[1:]:
             print(f"              {extra}")
     else:
         print("  发送端打开：  未检测到局域网地址（请先连接 Wi-Fi 或开热点）")
-    print(f"  配对码  ：  {STATE.pin}      （发送端首次打开需输入）")
-    print(f"  接收目录：  {STATE.recv_dir}")
+    print(f"  配对码  ：  {pin_show}      （发送端首次打开需输入）")
+    if cert:
+        print(f"  证书指纹：  {cert['fingerprint_short']}      （首次连接请在浏览器里核对）")
+    print(f"  接收目录：  {recv_show}")
     print(line)
     print("  提示：发送端连同一个 Wi-Fi / 接收端热点即可，不经过互联网，不耗移动流量。")
     print("        发送端浏览器菜单里「添加到主屏幕」，可当 App 用。")
@@ -179,6 +206,24 @@ def print_degraded_report() -> None:
     print(line)
 
 
+def print_refuse_degraded() -> None:
+    """安全版：模块损坏时拒绝启动，并说清是哪个模块、怎么修（P0-1）。"""
+    print()
+    line = "=" * 62
+    print(line)
+    print("  安全版无法在模块损坏时降级运行，已停止启动。")
+    print("  安全版的承诺是全程 TLS；降级诊断服务是明文 HTTP，不能作为退路。")
+    print("-" * 62)
+    for item in describe():
+        if item["state"] == "ok":
+            continue
+        label = "文件缺失" if item["state"] == "missing" else "加载失败"
+        print("  dlcore/%-11s %s  %s" % (item["name"] + ".py", label, item["error"] or "-"))
+    print("  修复办法：重新安装或从官方包恢复 dlcore/ 目录，然后重启。")
+    print(line)
+    print()
+
+
 def degraded_page() -> bytes:
     """降级诊断页：不依赖 web/ 目录，纯内联 HTML。"""
     rows = []
@@ -221,7 +266,12 @@ def degraded_page() -> bytes:
 
 
 def start_degraded(port: int = 8848):
-    """httpd 模块不可用时的最小服务：只回诊断页与 503，不碰文件系统。"""
+    """httpd 模块不可用时的最小服务：只回诊断页与 503，不碰文件系统。
+
+    安全版不允许走到这里：降级服务是明文 HTTP，会让「TLS 不可关」的承诺失效。
+    """
+    if config.is_secure_edition():
+        raise RuntimeError("安全版不允许降级为明文诊断服务")
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     page = degraded_page()
@@ -289,44 +339,81 @@ def start_server(port: int = 8848, pin: str = "", recv: str = "",
         STATE.pin = pin
     if recv:
         target = os.path.abspath(recv)
-        try:
-            os.makedirs(target, exist_ok=True)
+        if config.is_secure_edition():
+            # 安全版：用户显式给了 --recv，就必须「要么用它，要么拒绝启动」。
+            # 先判 UNC/网络路径（否则 makedirs 只会抛 WinError 5，看不出原因），
+            # 建不出来也直接拒绝，绝不回落到上一次的目录（P0-1 fail-open）。
+            from dlcore.sec import pathguard
+            try:
+                pathguard.check_recv_dir(target)
+            except ValueError as exc:
+                raise RuntimeError("安全版拒绝启动：%s" % exc)
+            try:
+                os.makedirs(target, exist_ok=True)
+            except OSError as exc:
+                raise RuntimeError("安全版拒绝启动：接收目录不可用（%s）" % exc)
+        else:
+            try:
+                os.makedirs(target, exist_ok=True)
+            except OSError as exc:
+                print(f"接收目录不可用：{exc}")
+                target = ""
+        if target:
             STATE.recv_dir = target
             STATE.config["recv_dir"] = target
             STATE.save()
-        except OSError as exc:
-            print(f"接收目录不可用：{exc}")
 
     # 启动时清理推送暂存，避免历史副本长期占磁盘
     try:
         n, freed = purge_send_cache()
         if n:
-            print(f"[清理] 推送暂存移除 {n} 个文件，释放 {freed / 1048576:.1f} MB")
+            log(f"[清理] 推送暂存移除 {n} 个文件，释放 {freed / 1048576:.1f} MB")
     except Exception:
         pass
 
-    # 清掉上次中断留下的临时文件（超过 24 小时的 .dl_*.part），避免长期占空间
+    # 清掉上次中断留下的临时文件（超过 24 小时的 .dl_*.part），之后每小时扫一次（S-11）
     def _sweep_parts():
         try:
-            deadline = time.time() - 86400
-            for dirpath, _dirs, files in os.walk(STATE.recv_dir):
-                for fn in files:
-                    if fn.startswith(".dl_") and fn.endswith(".part"):
-                        fp = os.path.join(dirpath, fn)
-                        try:
-                            if os.path.getmtime(fp) < deadline:
-                                os.unlink(fp)
-                        except OSError:
-                            pass
+            n, freed = sweep_parts(STATE.recv_dir, 86400)
+            if n:
+                print("[清理] 过期 .part 移除 %d 个，释放 %.1f MB" % (n, freed / 1048576))
         except Exception:
             pass
 
     threading.Thread(target=_sweep_parts, daemon=True).start()
 
+    def _parts_janitor():
+        while True:
+            time.sleep(3600)
+            _sweep_parts()
+
+    threading.Thread(target=_parts_janitor, daemon=True).start()
+
+    # 安全版：先把证书备好再监听；拿不到证书就拒绝启动（不允许悄悄退回明文）。
+    tls_ctx = None
+    cert_info = None
+    if config.is_secure_edition():
+        try:
+            from dlcore.sec import pathguard
+            # 接收目录本身是 UNC / 网络路径时直接拒绝（S-06，不等上传才炸）
+            pathguard.check_recv_dir(STATE.recv_dir)
+        except ValueError as exc:
+            raise RuntimeError("安全版拒绝启动：%s" % exc)
+        try:
+            from dlcore.sec import certgen, tls
+            cert_info = certgen.ensure_cert()          # 首次会打印「正在生成证书…」
+            tls_ctx = tls.make_context(cert_info["cert_path"], cert_info["key_path"])
+            # Host 与证书 SAN 不一致时只记日志、不拒绝（S-13）
+            STATE.cert_sans = {str(s).lower() for s in (cert_info.get("sans") or [])}
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("安全版 TLS 初始化失败，已停止启动：%s" % exc)
+
+    scheme = "https" if tls_ctx is not None else "http"
     httpd = None
     for offset in range(0, 20):
         try:
-            httpd = Server(("0.0.0.0", port + offset), Handler)
+            httpd = Server(("0.0.0.0", port + offset), Handler,
+                           context=tls_ctx, scheme=scheme)
             port = port + offset
             break
         except OSError:
@@ -335,13 +422,17 @@ def start_server(port: int = 8848, pin: str = "", recv: str = "",
         raise RuntimeError("端口被占用，无法启动")
 
     httpd.daemon_threads = True
+    urls = lan_urls(port, scheme)
     info = {
         "httpd": httpd,
         "port": port,
-        "urls": lan_urls(port),
+        "urls": urls,
         "pin": STATE.pin,
         "local_token": LOCAL_TOKEN,
         "recv_dir": STATE.recv_dir,
+        "scheme": scheme,
+        "local_url": "%s://127.0.0.1:%d" % (scheme, port),
+        "cert": cert_info,
     }
     # 定期清理过期会话/失败记录，避免长期运行内存增长（DL-09）
     def _janitor():
@@ -376,12 +467,23 @@ def main():
         config.set_secure(True)
 
     if args.selfcheck:
+        # 自检也报版本身份：同一份代码两个产物，排障时先确认「这是哪一版」
+        print("版本身份：edition=%s（%s）  v%s" % (
+            config.EDITION,
+            "安全版" if config.is_secure_edition() else "个人版",
+            VERSION))
         print(health_line())
         for item in describe():
             mark = "OK  " if item["state"] == "ok" else "降级"
             print("  %-2s dlcore/%-9s %-8s %s" % (
                 mark, item["name"] + ".py", item["state"], item["error"] or "-"))
         return 0 if not degraded_names() else 1
+
+    # 安全版：模块不完整就直接拒绝启动，不要先打印「降级运行…其余功能照常」
+    # 那句会让人以为还在跑（P3-2）。
+    if not module_ok("httpd") and config.is_secure_edition():
+        print_refuse_degraded()
+        return 2
 
     print_degraded_report()
 
@@ -412,16 +514,16 @@ def main():
     try:
         info = start_server(args.port, args.pin, args.recv, background=True)
     except RuntimeError as exc:
-        print(exc)
+        print(exc, file=sys.stderr)   # 启动失败写 stderr（脚本/日志都能抓到）
         return 1
 
     port, urls = info["port"], info["urls"]
-    print_banner(port, urls)
+    print_banner(port, urls, info.get("cert"))
 
     if not args.no_browser:
         def _open():
             time.sleep(0.8)
-            open_app_window(f"http://127.0.0.1:{port}/?k={LOCAL_TOKEN}")
+            open_app_window(f"{info['local_url']}/?k={LOCAL_TOKEN}")
         threading.Thread(target=_open, daemon=True).start()
 
     try:

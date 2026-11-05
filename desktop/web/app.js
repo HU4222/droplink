@@ -53,6 +53,10 @@
     selectedIp: localStorage.getItem('dl.ip') || '',
     peers: [],           // 已接入的终端
     sendFiles: [],       // 本机已选的待发送文件
+    edition: 'personal', // 运行期从 /api/ping 读取：personal | secure
+    pendingRid: '',      // 安全版：等待本机批准的 request_id
+    pendingTimer: 0,
+    pendingDeadline: 0,
   };
 
   /* ---------------- 小工具 ---------------- */
@@ -126,6 +130,26 @@
     return (e && e.message) || '网络异常';
   }
 
+  // 安全版的机器可读错误码 -> 中文提示（个人版没有 code 字段，走 error 原文）
+  const ERROR_TEXT = {
+    AUTH_REQUIRED: '需要先输入配对码',
+    AUTH_BAD_PIN: '配对码不正确',
+    LOCAL_ONLY: '这个操作只能在电脑本机完成',
+    FORBIDDEN: '没有权限执行这个操作',
+    TRANSFER_REJECTED: '电脑端拒绝了这次传输',
+    NO_ROUTE: '接口不存在（两端版本可能不一致）',
+    NOT_FOUND: '申请不存在或已被清理',
+    GONE: '申请已过期或已取消',
+    STATE_CONFLICT: '状态已经变化，请刷新后重试',
+    TOKEN_INVALID: '上传凭证无效或已使用',
+    SIZE_MISMATCH: '文件大小与申请时不一致',
+    CHECKSUM_MISMATCH: '文件校验失败（内容与声明不符）',
+    INVALID_NAME: '文件名不合法',
+    DISK_FULL: '接收端磁盘空间不足',
+    RATE_LIMITED: '请求过于频繁，请稍后再试',
+  };
+  const codeText = (code) => (code && ERROR_TEXT[code]) || '';
+
   async function api(path, opts = {}) {
     const init = { credentials: 'same-origin', ...opts };
     init.headers = Object.assign({}, init.headers || {});
@@ -151,7 +175,10 @@
       throw err;
     }
     if (!res.ok || (data && data.ok === false)) {
-      throw new Error((data && data.error) || `请求失败（${res.status}）`);
+      const err = new Error(codeText(data && data.code) || (data && data.error) || `请求失败（${res.status}）`);
+      err.code = data && data.code;
+      err.status = res.status;
+      throw err;
     }
     return data || {};
   }
@@ -538,6 +565,22 @@
     state.authed = true;
   }
 
+  /* 设备身份（安全版首次配对用）：本机生成一次，存在 localStorage。
+     UUID v4；老浏览器没有 crypto.randomUUID 时退化成随机串，格式仍满足服务端校验。 */
+  function deviceId() {
+    try {
+      let id = localStorage.getItem('dl_device_id');
+      if (id && /^[A-Za-z0-9._-]{8,64}$/.test(id)) return id;
+      id = (window.crypto && window.crypto.randomUUID)
+        ? window.crypto.randomUUID()
+        : ('dl-' + Date.now().toString(16) + '-' + Math.random().toString(16).slice(2, 14));
+      localStorage.setItem('dl_device_id', id);
+      return id;
+    } catch (e) {
+      return '';
+    }
+  }
+
   function deviceDisplayName() {
     const ua = navigator.userAgent || '';
     if (window.androidBridge && window.androidBridge.getDeviceInfo) {
@@ -580,8 +623,7 @@
    * 跨端提示浮层（1.4.5）：iOS / 鸿蒙首次访问时出现，5 秒后自动消失，也可手动关。
    * 只出现一次（localStorage 记忆），不打断浏览——首屏不再被占用。
    */
-  function showCompatTip() {
-    const box = $('#compatTip');
+  function showCompatTip() {    const box = $('#compatTip');
     if (!box) return;
     const pf = state.platform;
     // 只有装了原生 App 才有完整能力；其余（iOS / 鸿蒙 / 安卓浏览器 / 桌面浏览器）都提示一次
@@ -619,13 +661,120 @@
     showCompatTip._timer = setTimeout(hide, 5000);
   }
 
+  /* ---------------- 首次配对审批（安全版） ----------------
+     登录不再直接用 api()：安全版对新设备返回 202 pending_approval，这不是错误，
+     需要停在登录页等电脑本机点「批准」，再轮询 /api/login/status 拿会话。 */
+
+  async function loginRequest(pin) {
+    const body = JSON.stringify({
+      pin,
+      name: deviceDisplayName(),
+      device_id: deviceId(),
+      device_name: deviceDisplayName(),
+      platform: state.platform,
+    });
+    const headers = { 'Content-Type': 'application/json' };
+    if (DL_TOKEN) headers['X-DL-Token'] = DL_TOKEN;
+    const res = await fetch('/api/login', {
+      method: 'POST', body, headers, credentials: 'same-origin',
+    });
+    let data = null;
+    try { data = await res.json(); } catch (e) { data = null; }
+    return { status: res.status, data: data || {} };
+  }
+
+  function updatePendingText(expiresIn) {
+    const el = $('#pendingText');
+    if (!el) return;
+    let left = Math.max(0, Math.round((state.pendingDeadline - Date.now()) / 1000));
+    if (typeof expiresIn === 'number') left = Math.min(left, expiresIn);
+    const m = Math.floor(left / 60);
+    const s = left % 60;
+    el.textContent = `已提交，等待电脑端批准…（剩余 ${m}:${String(s).padStart(2, '0')}）`;
+  }
+
+  function stopPendingPoll() {
+    if (state.pendingTimer) { clearInterval(state.pendingTimer); state.pendingTimer = 0; }
+  }
+
+  function resetLoginPending() {
+    stopPendingPoll();
+    const box = $('#loginPending');
+    if (box) box.hidden = true;
+    const input = $('#pinInput');
+    if (input) input.disabled = false;
+    const btn = document.querySelector('.login-card [data-act="login"]');
+    if (btn) btn.hidden = false;
+  }
+
+  function pendingFail(msg) {
+    state.pendingRid = '';
+    resetLoginPending();
+    const errEl = $('#loginError');
+    if (errEl) errEl.textContent = msg;
+  }
+
+  function showPending(rid, expiresIn) {
+    state.pendingRid = rid;
+    state.pendingDeadline = Date.now() + Math.max(5, expiresIn || 300) * 1000;
+    const errEl = $('#loginError');
+    if (errEl) errEl.textContent = '';
+    const input = $('#pinInput');
+    if (input) input.disabled = true;
+    const btn = document.querySelector('.login-card [data-act="login"]');
+    if (btn) btn.hidden = true;
+    const hint = $('#pendingHint');
+    if (hint) hint.textContent = `设备：${deviceDisplayName()} · 让接收端电脑打开「我的」页点「批准」`;
+    const box = $('#loginPending');
+    if (box) box.hidden = false;
+    updatePendingText();
+    stopPendingPoll();
+    state.pendingTimer = setInterval(pollPending, 2000);
+    pollPending();
+  }
+
+  async function pollPending() {
+    const rid = state.pendingRid;
+    if (!rid) return;
+    if (Date.now() > state.pendingDeadline) {
+      pendingFail('等待超时：请在电脑端点「批准」后重新输入配对码');
+      return;
+    }
+    try {
+      const res = await fetch('/api/login/status?request_id=' + encodeURIComponent(rid),
+        { credentials: 'same-origin', cache: 'no-store' });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 200 && data.status === 'approved') {
+        stopPendingPoll();
+        state.pendingRid = '';
+        resetLoginPending();
+        hideLogin();
+        await boot();
+        return;
+      }
+      if (data.status === 'expired') { pendingFail('请求已过期，请重新输入配对码'); return; }
+      if (res.status === 403) { pendingFail('电脑端拒绝了这次连接'); return; }
+      if (res.status === 404) { pendingFail('请求已过期，请重新输入配对码'); return; }
+      updatePendingText(data.expires_in);
+    } catch (e) { /* 网络抖动：下一轮再试 */ }
+  }
+
   async function doLogin() {
     const pin = $('#pinInput').value.trim();
     const errEl = $('#loginError');
     if (!pin) { errEl.textContent = '请输入配对码'; return; }
     errEl.textContent = '';
     try {
-      await api('/api/login', { method: 'POST', body: JSON.stringify({ pin, name: deviceDisplayName() }) });
+      const r = await loginRequest(pin);
+      if (r.status === 202 && r.data.status === 'pending_approval') {
+        showPending(r.data.request_id, r.data.expires_in);
+        return;
+      }
+      if (r.status !== 200 || !r.data.ok) {
+        throw new Error(r.data.error || `请求失败（${r.status}）`);
+      }
+      state.pendingRid = '';
+      stopPendingPoll();
       hideLogin();
       await boot();
     } catch (e) {
@@ -634,9 +783,37 @@
     }
   }
 
+  /* ---------------- 安全版首次运行提示（S-14） ----------------
+     只出现一次，点「知道了」后记住；键名带版本号，升级后会再出现一次。
+     它不是安全功能的开关——关掉的只是这条提示。 */
+  function showSecureNotice(version) {
+    const box = $('#secureNotice');
+    if (!box) return;
+    const ver = String(version || (state.session && state.session.version) || 'v1').replace(/\./g, '_');
+    const key = 'dl_secure_notice_' + ver;
+    try { if (localStorage.getItem(key) === '1') { box.hidden = true; return; } } catch (e) {}
+    box.hidden = false;
+    const btn = $('#secureNoticeClose');
+    if (btn) btn.onclick = () => {
+      box.hidden = true;
+      try { localStorage.setItem(key, '1'); } catch (e) {}
+    };
+  }
+
+  /* 未登录首屏也要能看到安全提示（S-14 / P2-2）：
+     /api/ping 是公开接口，先从它拿 edition/version，再决定是否显示。 */
+  async function showSecureNoticeIfNeeded() {
+    try {
+      const r = await fetch('/api/ping', { cache: 'no-store' });
+      const d = await r.json();
+      if (d && d.edition === 'secure') showSecureNotice(d.version);
+    } catch (e) { /* 拿不到就等登录后的 session 分支 */ }
+  }
+
   /* ---------------- 启动 ---------------- */
 
   async function boot() {
+    await showSecureNoticeIfNeeded();
     try {
       const s = await api('/api/session');
       state.session = s;
@@ -648,8 +825,13 @@
         const autoPin = new URLSearchParams(location.search).get('pin');
         if (autoPin) {
           try {
-            await api('/api/login', { method: 'POST', body: JSON.stringify({ pin: autoPin }) });
-            return boot();
+            const r = await loginRequest(autoPin);
+            if (r.status === 202 && r.data.status === 'pending_approval') {
+              showLogin();
+              showPending(r.data.request_id, r.data.expires_in);
+              return;
+            }
+            if (r.status === 200 && r.data.ok) return boot();
           } catch (e) { /* 配对码错，落到登录页 */ }
         }
         showLogin(); return;
@@ -670,6 +852,7 @@
       renderSendPanel();
       renderDlQueue();
       showCompatTip();
+      if (s.secure) showSecureNotice(s.version);
       if (!window.__dlqTimer && dlBridge()) {
         window.__dlqTimer = setInterval(renderDlQueue, 1500);
       }
@@ -681,8 +864,12 @@
         const autoPin = new URLSearchParams(location.search).get('pin');
         if (autoPin) {
           try {
-            await api('/api/login', { method: 'POST', body: JSON.stringify({ pin: autoPin }) });
-            return boot();
+            const r = await loginRequest(autoPin);
+            if (r.status === 202 && r.data.status === 'pending_approval') {
+              showPending(r.data.request_id, r.data.expires_in);
+              return;
+            }
+            if (r.status === 200 && r.data.ok) return boot();
           } catch (err) { /* 配对码错，留在登录页 */ }
         }
         return;
@@ -1119,7 +1306,78 @@
     state.uploads.unshift(item);
     queue.push({ file, rel: rel || '', item });
     renderQueue();
-    pump();
+    if (state.edition === 'secure') {
+      // 安全版：先把这一批文件清单发给电脑等确认，拿到逐文件 token 再传
+      clearTimeout(gateTimer);
+      gateTimer = setTimeout(() => { openUploadSession().catch(() => {}); }, 400);
+    } else {
+      pump();
+    }
+  }
+
+  /* 安全版上传闸门：prepare（只发清单）→ 等本机接受 → 拿一次性 token 再逐文件传 */
+  let gateTimer = 0;
+  let gateBusy = false;
+  const tokenReady = new Map();   // item.id -> {session_id, file_id, token}
+
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function openUploadSession() {
+    if (gateBusy) return;
+    if (!queue.length) { pump(); return; }
+    gateBusy = true;
+    const batch = queue.slice();
+    let data = null;
+    try {
+      data = await api('/api/prepare-upload', {
+        method: 'POST',
+        body: JSON.stringify({
+          files: batch.map(({ file, rel }) => ({
+            name: file.name, size: file.size, rel: rel || '',
+          })),
+        }),
+      });
+      if (data.state === 'pending') {
+        toast('已把文件清单发给电脑，等待「接受」…');
+        const deadline = Date.now() + (data.expires_in || 300) * 1000;
+        while (Date.now() < deadline) {
+          await delay(1500);
+          data = await api('/api/upload/status?session_id=' + encodeURIComponent(data.session_id));
+          if (data.state !== 'pending') break;
+        }
+      }
+      if (data.state === 'accepted') {
+        (data.files || []).forEach((f) => {
+          if (!f.token) return;
+          const task = batch.find((t) => t.file.name === f.name
+            && t.file.size === f.size && !tokenReady.has(t.item.id));
+          if (task) {
+            tokenReady.set(task.item.id, {
+              session_id: data.session_id, file_id: f.file_id, token: f.token,
+            });
+          }
+        });
+      } else {
+        const why = { rejected: '电脑端拒绝了这次传输', cancelled: '传输已取消', expired: '确认超时' }[data.state] || '传输未获确认';
+        batch.forEach((task) => {
+          task.item.status = 'error';
+          task.item.error = why;
+          failedTasks.push(task);
+        });
+        renderQueue();
+        toast(why, true);
+      }
+    } catch (e) {
+      batch.forEach(({ item }) => {
+        item.status = 'error';
+        item.error = e.message || '确认失败';
+      });
+      renderQueue();
+      toast(e.message || '确认失败', true);
+    } finally {
+      gateBusy = false;
+      pump();
+    }
   }
 
   function pump() {
@@ -1136,8 +1394,28 @@
       item.xhr = xhr;
       item.status = 'up';
 
-      const qs = new URLSearchParams({ name: file.name });
-      if (rel) qs.set('rel', rel);
+      const qs = new URLSearchParams();
+      if (state.edition === 'secure') {
+        const tok = tokenReady.get(item.id);
+        if (!tok) {
+          // 还没拿到（或已用掉）token：过一会儿放回队列，让闸门重新申请
+          item.status = 'wait';
+          clearTimeout(gateTimer);
+          gateTimer = setTimeout(() => {
+            queue.unshift({ file, rel, item });
+            openUploadSession().catch(() => {});
+          }, 150);
+          resolve();
+          return;
+        }
+        tokenReady.delete(item.id);      // 一次性 token，交给服务端核销
+        qs.set('session_id', tok.session_id);
+        qs.set('file_id', tok.file_id);
+        qs.set('token', tok.token);
+      } else {
+        qs.set('name', file.name);
+        if (rel) qs.set('rel', rel);
+      }
       xhr.open('POST', `/api/upload?${qs.toString()}`);
       xhr.setRequestHeader('X-File-Mtime', String(file.lastModified || Date.now()));
 
@@ -1173,7 +1451,7 @@
           }
         } else {
           item.status = 'error';
-          item.error = data.error || `失败 ${xhr.status}`;
+          item.error = codeText(data.code) || data.error || `失败 ${xhr.status}`;
           failedTasks.push({ file, rel, item });
           finishOne(false);
           toast(item.error, true);
@@ -1319,13 +1597,16 @@
     failedTasks = [];
     startBatch();
     tasks.forEach((t) => {
+      if (!t.file) return;
       t.item.status = 'wait';
       t.item.loaded = 0;
+      tokenReady.delete(t.item.id);
       queue.push(t);
       batch.total++;
     });
     renderQueue();
-    pump();
+    if (state.edition === 'secure') openUploadSession().catch(() => {});
+    else pump();
   }
 
   async function loadTransfers() {
@@ -1658,8 +1939,10 @@
     const urls = s.lan_urls || [];
     const port = location.port || '8848';
     const android = isAndroid();
+    // 协议由服务端给（个人版 http、安全版 https）；旧服务端没有 scheme 字段时按页面协议兜底
+    const scheme = s.scheme || (location.protocol === 'https:' ? 'https' : 'http');
     const mainUrl = state.selectedIp
-      ? `http://${state.selectedIp}:${port}`
+      ? `${scheme}://${state.selectedIp}:${port}`
       : (urls[0] || (location.origin.includes('127.0.0.1') ? '' : location.origin));
     // 安卓端二维码带上配对码，扫码即可自动配对（扫码即连）
     const qrText = android && s.pin ? `${mainUrl}?pin=${s.pin}` : mainUrl;
@@ -1836,10 +2119,115 @@
       </p>
     </div>`);
 
+    // 安全版：设备信任（只在电脑本机显示，卡片沿用现有 card / kv 样式）
+    if (state.edition === 'secure' && s.local) {
+      html.push(`<div class="card">
+        <h3>待确认的传输</h3>
+        <div id="inboxApprovals"><p class="muted" style="font-size:12.5px;margin:0">正在读取…</p></div>
+      </div>`);
+      html.push(`<div class="card">
+        <h3>待批准的设备</h3>
+        <div id="trustPending"><p class="muted" style="font-size:12.5px;margin:0">正在读取…</p></div>
+      </div>`);
+      html.push(`<div class="card">
+        <h3>已信任设备</h3>
+        <div id="trustedList"><p class="muted" style="font-size:12.5px;margin:0">正在读取…</p></div>
+        <p class="muted" style="font-size:12px;margin:8px 0 0">
+          撤销后，这台设备已经建立的会话立即失效，下次连接需要重新批准。
+        </p>
+        <div class="sheet-actions" style="margin-top:8px">
+          <button class="btn" data-act="trustRefresh">刷新</button>
+        </div>
+      </div>`);
+    }
+
     // 署名（G-16）：只在「我的」页底部出现一次，不放进按钮/提示/引导文案
     html.push('<p class="author">由 HU4222 制作 · DropLink</p>');
 
     $('#aboutBody').innerHTML = html.join('');
+    if (state.edition === 'secure' && s.local) {
+      loadApprovals();
+      loadTrust();
+    }
+  }
+
+  /* ---------------- 待确认的传输（安全版）：接受前一个字节都不落盘 ---------------- */
+
+  async function loadApprovals() {
+    const box = $('#inboxApprovals');
+    if (!box) return;
+    try {
+      const d = await api('/api/approve/pending');
+      const items = d.sessions || [];
+      if (!items.length) {
+        box.innerHTML = '<p class="muted" style="font-size:12.5px;margin:0">暂无。对方发起传输后会出现在这里；接受前接收目录不会收到任何字节。</p>';
+        return;
+      }
+      box.innerHTML = items.map((it) => {
+        const files = (it.files || []).slice(0, 20).map((f) =>
+          `<div class="kv"><span>${esc(f.name)}</span><b>${fmtSize(f.size)}</b></div>`).join('');
+        const more = (it.files || []).length > 20
+          ? `<p class="muted" style="font-size:12px;margin:4px 0">…还有 ${it.files.length - 20} 个文件</p>` : '';
+        return `<div style="margin:0 0 12px">
+          <div class="kv"><span>${esc(it.device_name || '未知设备')} · ${esc(it.ip)}</span><b>${it.file_count} 个文件 · ${fmtSize(it.total_bytes)}</b></div>
+          <div class="kv"><span>剩余确认时间</span><b>${Math.max(1, Math.ceil((it.expires_in || 0) / 60))} 分钟</b></div>
+          ${files}${more}
+          <div style="display:flex;gap:8px;margin:8px 0 4px">
+            <button class="btn btn-sm btn-primary" data-act="approveAccept" data-id="${esc(it.session_id)}">全部接受</button>
+            <button class="btn btn-sm" data-act="approveReject" data-id="${esc(it.session_id)}">全部拒绝</button>
+          </div>
+        </div>`;
+      }).join('');
+    } catch (e) {
+      box.innerHTML = `<p class="muted" style="font-size:12.5px;margin:0">${esc(e.message || '读取失败')}</p>`;
+    }
+  }
+
+  /* ---------------- 设备信任（安全版） ---------------- */
+
+  function fmtTime(ts) {
+    if (!ts) return '-';
+    try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return '-'; }
+  }
+
+  async function loadTrust() {
+    const pendingBox = $('#trustPending');
+    const listBox = $('#trustedList');
+    if (!pendingBox && !listBox) return;
+    try {
+      const [p, t] = await Promise.all([
+        api('/api/trust/pending').catch(() => ({ pending: [] })),
+        api('/api/trust').catch(() => ({ devices: [] })),
+      ]);
+      const pending = (p && p.pending) || [];
+      if (pendingBox) {
+        pendingBox.innerHTML = pending.length ? pending.map((it) => `
+          <div class="kv"><span>${esc(it.name)} · ${esc(it.platform || '')}</span><b class="mono">${esc(it.ip)}</b></div>
+          <div class="kv"><span>请求码</span><b class="mono">${esc(it.device_id_short)}</b></div>
+          <div style="display:flex;gap:8px;margin:6px 0 14px">
+            <button class="btn btn-sm btn-primary" data-act="trustApprove" data-id="${esc(it.request_id)}">批准</button>
+            <button class="btn btn-sm" data-act="trustReject" data-id="${esc(it.request_id)}">拒绝</button>
+          </div>`).join('')
+          : '<p class="muted" style="font-size:12.5px;margin:0">暂无待批准的设备。第一次连接的手机/电脑会出现在这里。</p>';
+      }
+      const devices = (t && t.devices) || [];
+      if (listBox) {
+        listBox.innerHTML = devices.length ? devices.map((d) => `
+          <div class="kv"><span>${esc(d.name)} · ${esc(d.platform || '')}</span><b class="mono">${esc(d.last_ip || '-')}</b></div>
+          <div class="kv"><span>最近连接</span><b>${esc(fmtTime(d.last_seen))}</b></div>
+          <div class="kv"><span>自动接受传输</span><b>${d.auto_accept ? '开' : '关'}</b></div>
+          <div style="display:flex;gap:8px;margin:4px 0 12px;flex-wrap:wrap">
+            <button class="btn btn-sm btn-danger" data-act="trustRevoke" data-id="${esc(d.device_id)}">撤销</button>
+            <button class="btn btn-sm" data-act="trustAutoAccept" data-id="${esc(d.device_id)}" data-on="${d.auto_accept ? '1' : '0'}">${d.auto_accept ? '关闭自动接受' : '开启自动接受'}</button>
+            <span class="muted" style="font-size:12px;align-self:center">ID ${esc(d.device_id_short)}</span>
+          </div>`).join('')
+          : '<p class="muted" style="font-size:12.5px;margin:0">还没有信任任何设备。</p>';
+      }
+    } catch (e) {
+      if (pendingBox) {
+        pendingBox.innerHTML = `<p class="muted" style="font-size:12.5px;margin:0">${esc(e.message || '读取失败')}</p>`;
+      }
+    }
   }
 
   /* ---------------- 使用引导 ---------------- */
@@ -2007,6 +2395,62 @@
 
     switch (act) {
       case 'login': doLogin(); break;
+      case 'cancelPending': pendingFail('已取消，请重新输入配对码'); break;
+      case 'trustRefresh': loadTrust(); loadApprovals(); toast('已刷新'); break;
+      case 'trustAutoAccept': {
+        const on = actEl.dataset.on === '1';
+        try {
+          await api('/api/trust/auto-accept', {
+            method: 'POST', body: JSON.stringify({ device_id: actEl.dataset.id, enabled: !on }),
+          });
+          toast(!on ? '已开启：该设备以后直接传，不再弹确认' : '已关闭：该设备传文件需要先确认', 'ok');
+          loadTrust();
+        } catch (e) { toast(e.message, true); }
+        break;
+      }
+      case 'approveAccept':
+      case 'approveReject': {
+        const action = act === 'approveAccept' ? 'accept' : 'reject';
+        try {
+          await api('/api/approve', {
+            method: 'POST', body: JSON.stringify({ session_id: actEl.dataset.id, action }),
+          });
+          toast(action === 'accept' ? '已接受，开始接收文件' : '已拒绝这次传输', 'ok');
+          loadApprovals();
+        } catch (e) { toast(e.message, true); }
+        break;
+      }
+      case 'trustApprove': {
+        try {
+          await api('/api/trust/approve', {
+            method: 'POST', body: JSON.stringify({ request_id: actEl.dataset.id }),
+          });
+          toast('已批准，正在连接的设备会拿到会话', 'ok');
+          loadTrust();
+        } catch (e) { toast(e.message, true); }
+        break;
+      }
+      case 'trustReject': {
+        try {
+          await api('/api/trust/reject', {
+            method: 'POST', body: JSON.stringify({ request_id: actEl.dataset.id }),
+          });
+          toast('已拒绝');
+          loadTrust();
+        } catch (e) { toast(e.message, true); }
+        break;
+      }
+      case 'trustRevoke': {
+        if (!confirm('撤销后这台设备已经建立的会话会立刻断开，下次连接需要重新批准。继续？')) break;
+        try {
+          await api('/api/trust/revoke', {
+            method: 'POST', body: JSON.stringify({ device_id: actEl.dataset.id }),
+          });
+          toast('已撤销', 'ok');
+          loadTrust();
+        } catch (e) { toast(e.message, true); }
+        break;
+      }
       case 'theme': {
         const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
         localStorage.setItem(THEME_KEY, next);
@@ -2375,12 +2819,23 @@
       <input id="searchInput" placeholder="搜索当前文件夹（含子文件夹）" autocomplete="off" spellcheck="false">
       <button class="chip is-on" data-act="closeSearch">取消</button>`;
     $('#fileList').before(bar);
-    $('#searchInput').focus();
-    $('#searchInput').addEventListener('input', debounce((ev) => {
-      const q = ev.target.value.trim();
+    const input = $('#searchInput');
+    input.focus();
+    // 手机上输入法组词期间可能不触发 input（Android WebView 尤其明显），
+    // 因此同时监听 compositionend；回车则立刻搜，不等防抖。
+    const run = () => {
+      const q = input.value.trim();
       if (!q) { closeSearch(); return; }
       doSearch(q);
-    }, 320));
+    };
+    const runDebounced = debounce(run, 320);
+    input.addEventListener('input', runDebounced);
+    input.addEventListener('compositionend', runDebounced);
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') { ev.preventDefault(); run(); }
+    });
+    // 窄屏下搜索框可能落在可视区外，滚进来，否则看起来像「点了没反应」
+    try { bar.scrollIntoView({ block: 'nearest' }); } catch (e) {}
   }
 
   function closeSearch() {
@@ -2403,7 +2858,7 @@
     state.searching = true;
     try {
       const d = await api(`/api/search?q=${encodeURIComponent(q)}&path=${encodeURIComponent(state.path)}`);
-      state.list = d.entries;
+      state.list = d.entries || d.results || [];   // 兼容旧安卓端返回 results
       state.animateList = true;
       renderBrowse();
     } catch (e) {
@@ -2476,8 +2931,28 @@
   // 原生（安卓 App）回调：显示 toast / 接收扫码结果
   window.__toast = (m) => toast(m);
 
+  // 版本身份：安全版才有设备审批 / 信任列表，个人版界面保持原样
+  async function detectEdition() {
+    try {
+      const r = await fetch('/api/ping', { cache: 'no-store' });
+      const d = await r.json();
+      state.edition = d && d.edition === 'secure' ? 'secure' : 'personal';
+    } catch (e) {
+      state.edition = 'personal';
+    }
+    window.__EDITION__ = state.edition;
+  }
+
   initTheme();
   initTips();
   initViz();
-  boot();
+  detectEdition().finally(() => boot());
+
+  // 安全版：停在「我的」页时定期刷新待确认传输 / 待批准设备
+  setInterval(() => {
+    if (state.authed && state.edition === 'secure' && state.view === 'about') {
+      loadApprovals();
+      loadTrust();
+    }
+  }, 5000);
 })();
